@@ -161,6 +161,49 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(imageReply.attachments[0].data, Buffer.from("person-image").toString("base64"));
   agent.send(JSON.stringify({ type: "reply_result", requestId: imageReply.requestId, sessionId, generation, ok: true }));
   assert.equal((await imageReplyResponse).status, 200);
+
+  const annotationResponse = await fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/annotations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "annotation-contract", annotation: {
+      id: "ann-contract", blockId: "block-1", startOffset: 0, endOffset: 6, type: "COMMENT", text: "Clarify this", originalText: "Remote", createdA: 1
+    } })
+  });
+  assert.equal(annotationResponse.status, 200);
+  const annotation = (await annotationResponse.json()).annotation;
+  assert.equal(annotation.message_id, opened.thread.messages[0].id);
+  const pendingAttachments = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}/attachments`)).json();
+  assert.equal(pendingAttachments.annotations.length, 1);
+  const beforeAnnotationReply = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
+  const annotationReplyDelivery = nextMessage(agent, "reply");
+  const annotationReplyResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({
+      serverSession: centralHealth.serverSession, idempotency_key: "annotation-reply-contract", words: "Address the comment",
+      feedback: "# Feedback on your messages\n\n> Clarify this", annotation_ids: ["ann-contract"], seen_through_seq: beforeAnnotationReply.cursor
+    })
+  });
+  const annotationReply = await annotationReplyDelivery;
+  assert.match(annotationReply.text, /Address the comment/);
+  assert.match(annotationReply.text, /Clarify this/);
+  agent.send(JSON.stringify({ type: "reply_result", requestId: annotationReply.requestId, sessionId, generation, ok: true }));
+  assert.equal((await annotationReplyResponse).status, 200);
+  const sentAttachments = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}/attachments`)).json();
+  assert.equal(sentAttachments.annotations.length, 0);
+
+  const ackDelivery = nextMessage(agent, "reply");
+  const ackResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/ack`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "ack-contract", ack: true })
+  });
+  const ack = await ackDelivery;
+  assert.match(ack.text, /Looks good/);
+  assert.match(ack.text, new RegExp(opened.thread.messages[0].id));
+  agent.send(JSON.stringify({ type: "reply_result", requestId: ack.requestId, sessionId, generation, ok: true }));
+  assert.equal((await ackResponse).status, 200);
+
   const stopDelivery = nextMessage(agent, "stop");
   const control = opened.thread.messages.find((message) => message.body.includes("Stop agent"));
   const stoppedResponse = fetch(`${forwardedBase}/messages/${control.id}/picks`, {

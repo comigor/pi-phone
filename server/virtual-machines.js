@@ -205,6 +205,7 @@ export class VirtualMachines {
       thread_name: null,
       base_path: session.cwd,
       seq: index + 1,
+      ack: session.acks?.[mid] || null,
       ...(attachments.length ? { attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })) } : {})
     };
   }
@@ -349,6 +350,102 @@ export class VirtualMachines {
     return undefined;
   }
 
+  messageById(session, messageIdValue) {
+    return this.messagesFor(session).find((message) => message.id === messageIdValue);
+  }
+
+  pendingAnnotations(session) {
+    return (session.messageAnnotations || []).filter((record) => !record.sent_reply_id && !record.removed_at);
+  }
+
+  attachmentsModel(session) {
+    return {
+      attachments: this.messagesFor(session).flatMap((message) => message.attachments || []),
+      annotations: this.pendingAnnotations(session)
+    };
+  }
+
+  async saveAnnotation(machine, messageIdValue, body, response) {
+    requireKey(body.idempotency_key);
+    const session = this.findByMessage(machine, messageIdValue);
+    const target = session && this.messageById(session, messageIdValue);
+    if (!session || !target) return send(response, 404, { code: "message_not_found" });
+    const input = body.annotation;
+    if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(input.id) ||
+      typeof input.text !== "string" || !input.text.trim() || input.text.length > 10_000 || input.type === "DELETION" ||
+      (!input.diagramAnchor && (typeof input.originalText !== "string" || !input.originalText.trim() || input.originalText.length > 20_000))) {
+      return send(response, 422, { code: "validation_error", error: "A message comment needs an id, quote, and text" });
+    }
+    if (target.author.kind !== "agent") return send(response, 422, { code: "annotation_not_allowed", error: "Comments are allowed on agent messages" });
+    session.messageAnnotations ??= [];
+    const previous = session.messageAnnotations.find((record) => record.id === input.id);
+    if (previous?.sent_reply_id || previous?.removed_at) return send(response, 409, { code: "annotation_closed", error: "This comment is already closed" });
+    const record = {
+      id: input.id,
+      message_id: messageIdValue,
+      thread_id: id("msg", session.key),
+      attachment_id: "",
+      path: messageIdValue,
+      version: "current",
+      message: { at: target.created_at },
+      annotation: { ...input, text: input.text.trim() },
+      sent_reply_id: null,
+      created_at: previous?.created_at || new Date().toISOString()
+    };
+    if (previous) Object.assign(previous, record);
+    else session.messageAnnotations.push(record);
+    await this.store.persist();
+    const saved = previous || record;
+    await this.changed(session, { annotation: saved });
+    return send(response, 200, { annotation: saved });
+  }
+
+  async removeAnnotation(machine, annotationId, response) {
+    for (const session of this.sessions(machine)) {
+      const record = (session.messageAnnotations || []).find((item) => item.id === annotationId);
+      if (!record) continue;
+      if (record.sent_reply_id || record.removed_at) return send(response, 409, { code: "annotation_closed", error: "This comment is already closed" });
+      record.removed_at = new Date().toISOString();
+      await this.store.persist();
+      await this.changed(session, { annotation: record });
+      return send(response, 200, { annotation: record });
+    }
+    return send(response, 404, { code: "annotation_not_found" });
+  }
+
+  async acknowledge(machine, messageIdValue, body, response) {
+    const key = requireKey(body.idempotency_key);
+    const session = this.findByMessage(machine, messageIdValue);
+    if (!session) return send(response, 404, { code: "message_not_found" });
+    session.acks ??= {};
+    if (body.ack === false) {
+      delete session.acks[messageIdValue];
+      await this.store.persist();
+      await this.changed(session, { message: this.messageById(session, messageIdValue) });
+      return send(response, 200, { message: this.messageById(session, messageIdValue) });
+    }
+    const reaction = body.reaction || body.ack_reaction || {};
+    const ack = {
+      emoji: typeof reaction.emoji === "string" ? reaction.emoji : "👍",
+      label: typeof reaction.label === "string" ? reaction.label : "Looks good",
+      settled_seq: null,
+      delivered_at: null
+    };
+    session.acks[messageIdValue] = ack;
+    await this.store.persist();
+    await this.changed(session, { message: this.messageById(session, messageIdValue) });
+    await this.deliverReply({
+      key: session.key, generation: session.generation, requestId: key, attachments: [],
+      text: `The person reacted ${ack.emoji}${ack.label ? ` ${ack.label}` : ""} to your message (${messageIdValue}).`
+    });
+    ack.settled_seq = session.virtualCursor || 0;
+    ack.delivered_at = new Date().toISOString();
+    await this.store.persist();
+    const message = this.messageById(session, messageIdValue);
+    await this.changed(session, { message });
+    return send(response, 200, { message });
+  }
+
   async changed(session, record) {
     const machine = this.machines.get(session.hostId);
     if (!machine) return;
@@ -387,16 +484,25 @@ export class VirtualMachines {
 
   async reply(_machine, session, body, _request, response, compose = false) {
     const key = requireKey(body.idempotency_key);
-    const text = compose ? body.body : body.words;
-    if (typeof text !== "string" || !text.trim()) return send(response, 422, { code: "validation_error", error: "Message text is required" });
+    const words = compose ? body.body : body.words;
+    const feedback = typeof body.feedback === "string" ? body.feedback.trim() : "";
+    if ((typeof words !== "string" && !feedback) || (typeof words === "string" && !words.trim() && !feedback)) {
+      return send(response, 422, { code: "validation_error", error: "Message text or feedback is required" });
+    }
+    const text = [typeof words === "string" ? words.trim() : "", feedback].filter(Boolean).join("\n\n");
     if (!compose && body.seen_through_seq !== session.virtualCursor) return send(response, 409, { code: "thread_moved_on", error: "Read the latest thread before replying" });
     const attachments = (body.uploads || []).map((uploadId) => this.uploads.get(uploadId)).filter(Boolean);
     const previous = (session.remoteReplies || []).find((message) => message.requestId === key);
     if (previous) return send(response, 200, { reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
     await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });
     const appended = await this.store.appendRemoteReply(session.key, { requestId: key, text, attachments });
-    await this.changed(session);
     const reply = this.virtualMessage(session, appended.message, session.messages.length);
+    const annotationIds = new Set(Array.isArray(body.annotation_ids) ? body.annotation_ids.filter((value) => typeof value === "string") : []);
+    for (const record of session.messageAnnotations || []) {
+      if (annotationIds.has(record.id) && !record.removed_at) record.sent_reply_id = reply.id;
+    }
+    if (annotationIds.size) await this.store.persist();
+    await this.changed(session);
     if (compose) return send(response, 200, { thread_id: id("msg", session.key), message: reply, project: projectFor(session), replayed: false });
     return send(response, 200, { reply, thread: this.thread(session).thread });
   }
@@ -438,6 +544,11 @@ export class VirtualMachines {
       const upload = this.uploads.get(match[1]);
       return upload ? send(response, 200, { text: upload.data.toString("utf8") }) : send(response, 404, { code: "upload_not_found" });
     }
+    match = route.match(new RegExp("^threads/([^/]+)/attachments$"));
+    if (match && request.method === "GET") {
+      const session = this.session(machine, match[1]);
+      return session ? send(response, 200, this.attachmentsModel(session)) : send(response, 404, { code: "thread_not_found" });
+    }
     match = route.match(new RegExp("^threads/([^/]+)$"));
     if (match && request.method === "GET") {
       const session = this.session(machine, match[1]);
@@ -448,6 +559,12 @@ export class VirtualMachines {
       const session = this.session(machine, match[1]);
       return session ? send(response, 200, this.sessionList(machine, session.key)) : send(response, 404, { code: "thread_not_found" });
     }
+    match = route.match(new RegExp("^annotations/([^/]+)/remove$"));
+    if (match && request.method === "POST") return this.removeAnnotation(machine, match[1], response);
+    match = route.match(new RegExp("^messages/([^/]+)/annotations$"));
+    if (match && request.method === "POST") return this.saveAnnotation(machine, match[1], await bodyJson(request), response);
+    match = route.match(new RegExp("^messages/([^/]+)/ack$"));
+    if (match && request.method === "POST") return this.acknowledge(machine, match[1], await bodyJson(request), response);
     match = route.match(new RegExp("^threads/([^/]+)/(seen|read|unread|mark-unread|snooze)$"));
     if (match && request.method === "POST") {
       const session = this.session(machine, match[1]);
