@@ -114,9 +114,11 @@ export class InboxStore {
     const key = sessionKey(hostId, incoming.sessionId);
     let session = this.state.sessions.find((item) => item.key === key);
     if (!session) {
-      session = { key, hostId, sessionId: incoming.sessionId, generation: incoming.generation, messages: [] };
+      session = { key, hostId, sessionId: incoming.sessionId, generation: incoming.generation, messages: [], remoteReplies: [], virtualCursor: 0 };
       this.state.sessions.push(session);
     }
+    const nextMessages = cleanMessages(incoming.messages);
+    const changed = session.status !== (incoming.status || "idle") || JSON.stringify(session.messages) !== JSON.stringify(nextMessages);
     Object.assign(session, {
       generation: incoming.generation,
       cwd: excerpt(incoming.cwd, 2048),
@@ -124,16 +126,40 @@ export class InboxStore {
       model: excerpt(incoming.model, 200),
       thinkingLevel: excerpt(incoming.thinkingLevel, 40),
       status: excerpt(incoming.status, 40) || "idle",
-      messages: cleanMessages(incoming.messages),
+      messages: nextMessages,
       online: true,
       updatedAt: new Date().toISOString()
     });
+    session.remoteReplies ??= [];
+    session.virtualCursor = (session.virtualCursor ?? 0) + (changed ? 1 : 0);
     await this.persist();
     return session;
   }
 
   getSession(key) {
     return this.state.sessions.find((item) => item.key === key);
+  }
+
+  async appendRemoteReply(key, { requestId, text, attachments = [] }) {
+    const session = this.getSession(key);
+    if (!session) throw new Error("Unknown session");
+    session.remoteReplies ??= [];
+    const previous = session.remoteReplies.find((message) => message.requestId === requestId);
+    if (previous) return { session, message: previous, replayed: true };
+    const message = { id: `relay:${requestId}`, requestId, role: "user", text, attachments, createdAt: new Date().toISOString() };
+    session.remoteReplies.push(message);
+    session.virtualCursor = (session.virtualCursor ?? 0) + 1;
+    await this.persist();
+    return { session, message, replayed: false };
+  }
+
+  async updateVirtualSession(key, update) {
+    const session = this.getSession(key);
+    if (!session) throw new Error("Unknown session");
+    Object.assign(session, update);
+    session.virtualCursor = (session.virtualCursor ?? 0) + 1;
+    await this.persist();
+    return session;
   }
 
   async addInbox({ hostId, session, runId, kind, title, body }) {
@@ -199,7 +225,7 @@ export class InboxStore {
   publicState() {
     return {
       hosts: this.state.hosts.map((host) => ({ ...host, publicKey: undefined })),
-      sessions: this.state.sessions.map(({ messages, ...session }) => ({ ...session, messageCount: messages.length })),
+      sessions: this.state.sessions.map(({ messages, remoteReplies, ...session }) => ({ ...session, messageCount: messages.length + (remoteReplies?.length ?? 0) })),
       inbox: this.state.inbox
     };
   }

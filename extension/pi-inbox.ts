@@ -6,13 +6,18 @@ import WebSocket from "ws";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type Identity = { hostId: string; publicKey: string; privateKey: string };
+type RelayAttachment = { name?: string; mimeType: string; data: string };
 type Snapshot = ReturnType<typeof buildSnapshot>;
 
 const relayUrl = process.env.PI_INBOX_RELAY_URL ?? "wss://inbox-relay.borges.dev";
 
-function loadIdentity(): Identity {
+function stateDirectory(): string {
   const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
-  const stateDir = process.env.PI_INBOX_STATE_DIR ?? path.join(agentDir, "pi-inbox");
+  return process.env.PI_INBOX_STATE_DIR ?? path.join(agentDir, "pi-inbox");
+}
+
+function loadIdentity(): Identity {
+  const stateDir = stateDirectory();
   const identityFile = path.join(stateDir, "identity.json");
   try {
     return JSON.parse(readFileSync(identityFile, "utf8"));
@@ -36,6 +41,14 @@ function textContent(content: unknown): string {
   return content.filter((block) => block?.type === "text").map((block) => block.text).join("\n");
 }
 
+function imageContent(content: unknown) {
+  if (!Array.isArray(content)) return [];
+  return content.filter((block) => block?.type === "image" && typeof block.data === "string").map((block) => ({
+    data: block.data,
+    mimeType: block.mimeType || "image/png"
+  }));
+}
+
 function buildSnapshot(ctx: ExtensionContext, generation: string, status: string) {
   const messages = ctx.sessionManager.getBranch().flatMap((entry) => {
     if (entry.type !== "message") return [];
@@ -49,6 +62,7 @@ function buildSnapshot(ctx: ExtensionContext, generation: string, status: string
       id: entry.id,
       role: message.role,
       text: textContent(content),
+      images: imageContent(content),
       toolCalls,
       stopReason: "stopReason" in message ? message.stopReason : undefined,
       errorMessage: "errorMessage" in message ? message.errorMessage : undefined
@@ -126,7 +140,7 @@ class PiInboxRuntime {
         nonce: challenge.nonce,
         signature
       })) socketUrl.searchParams.set(key, value);
-      const socket = new WebSocket(socketUrl, { maxPayload: 4 * 1024 * 1024 });
+      const socket = new WebSocket(socketUrl, { maxPayload: 32 * 1024 * 1024 });
       this.socket = socket;
       socket.on("open", () => {
         this.connecting = false;
@@ -183,12 +197,43 @@ class PiInboxRuntime {
       this.snapshot(this.latestSnapshot.status);
       return;
     }
+    if (message.type === "stop") {
+      try {
+        if (message.sessionId !== this.latestSnapshot.sessionId || message.generation !== this.generation) throw new Error("Session changed");
+        await this.ctx.abort();
+        this.send({ type: "stop_result", requestId: message.requestId, sessionId: this.latestSnapshot.sessionId, generation: this.generation, ok: true });
+        this.snapshot("idle");
+      } catch (error) {
+        this.send({ type: "stop_result", requestId: message.requestId, sessionId: this.latestSnapshot.sessionId, generation: this.generation, ok: false, error: error instanceof Error ? error.message : "Stop failed" });
+      }
+      return;
+    }
+
     if (message.type !== "reply") return;
     try {
       if (message.sessionId !== this.latestSnapshot.sessionId || message.generation !== this.generation) throw new Error("Session changed");
       if (typeof message.text !== "string" || message.text.length === 0) throw new Error("Empty reply");
-      if (this.ctx.isIdle()) this.pi.sendUserMessage(message.text);
-      else this.pi.sendUserMessage(message.text, { deliverAs: "followUp" });
+      const attachments: RelayAttachment[] = Array.isArray(message.attachments) ? message.attachments : [];
+      const images = attachments.filter((item) => typeof item.mimeType === "string" && item.mimeType.startsWith("image/"));
+      const files = attachments.filter((item) => !images.includes(item));
+      let text = message.text;
+      if (files.length) {
+        const uploadDir = path.join(stateDirectory(), "uploads", message.requestId);
+        mkdirSync(uploadDir, { recursive: true, mode: 0o700 });
+        const paths = files.map((file) => {
+          const filename = String(file.name || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
+          const target = path.join(uploadDir, filename);
+          writeFileSync(target, Buffer.from(file.data, "base64"), { mode: 0o600 });
+          return target;
+        });
+        text += `\n\nAttached files:\n${paths.map((target) => `- ${target}`).join("\n")}`;
+      }
+      const content = images.length ? [
+        { type: "text", text },
+        ...images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }))
+      ] : text;
+      if (this.ctx.isIdle()) this.pi.sendUserMessage(content);
+      else this.pi.sendUserMessage(content, { deliverAs: "followUp" });
       this.send({ type: "reply_result", requestId: message.requestId, sessionId: this.latestSnapshot.sessionId, generation: this.generation, ok: true });
       this.snapshot(this.ctx.isIdle() ? "idle" : "running");
     } catch (error) {

@@ -7,14 +7,13 @@ import { WebSocket, WebSocketServer } from "ws";
 import { InboxStore } from "./store.js";
 import { PushDispatcher } from "./push.js";
 import { parseMessage, requireString, verifyAgentSignature } from "./protocol.js";
+import { VirtualMachines } from "./virtual-machines.js";
+import { PlannotatorRuntime } from "./plannotator.js";
 
 const PUBLIC_FILES = new Map([
-  ["/", "index.html"],
+  ["/legacy", "index.html"],
   ["/app.js", "app.js"],
   ["/styles.css", "styles.css"],
-  ["/sw.js", "sw.js"],
-  ["/manifest.webmanifest", "manifest.webmanifest"],
-  ["/icon.svg", "icon.svg"]
 ]);
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -54,6 +53,7 @@ function lastAssistantText(session) {
 export class InboxHub {
   constructor(options) {
     this.publicDir = options.publicDir;
+    this.plannotator = options.plannotator;
     this.publicUrl = options.publicUrl;
     this.store = options.store;
     this.push = options.push;
@@ -65,10 +65,11 @@ export class InboxHub {
     this.viewers = new Set();
     this.challenges = new Map();
     this.pendingReplies = new Map();
-    this.agentWss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
+    this.agentWss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
     this.viewerWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     this.agentHttp = createServer((request, response) => this.handleAgentHttp(request, response));
     this.viewerHttp = createServer((request, response) => this.handleViewerHttp(request, response));
+    this.doorHttp = createServer((request, response) => this.virtual.route(request, response).catch((error) => sendJson(response, 400, { error: error.message })));
     this.agentHttp.on("upgrade", (request, socket, head) => this.handleAgentUpgrade(request, socket, head));
     this.viewerHttp.on("upgrade", (request, socket, head) => this.handleViewerUpgrade(request, socket, head));
     this.agentWss.on("connection", (socket, _request, host) => this.handleAgentSocket(socket, host));
@@ -80,26 +81,39 @@ export class InboxHub {
     await store.load();
     const push = new PushDispatcher(options.dataDir, options.publicUrl, store);
     await push.load();
-    return new InboxHub({ ...options, store, push });
+    const hub = new InboxHub({ ...options, store, push });
+    hub.virtual = new VirtualMachines({
+      store,
+      dataDir: options.dataDir,
+      publicAddress: options.virtualAddress,
+      linkMachine: options.linkMachine,
+      deliverReply: (input) => hub.deliverReply(input),
+      stopSession: (input) => hub.stopSession(input)
+    });
+    await hub.virtual.load();
+    return hub;
   }
 
-  async listen({ viewerPort, agentPort, host }) {
-    await Promise.all([
+  async listen({ viewerPort, agentPort, doorPort, host }) {
+    const listeners = [
       new Promise((resolve) => this.viewerHttp.listen(viewerPort, host, resolve)),
       new Promise((resolve) => this.agentHttp.listen(agentPort, host, resolve))
-    ]);
+    ];
+    if (doorPort !== undefined) listeners.push(new Promise((resolve) => this.doorHttp.listen(doorPort, host, resolve)));
+    await Promise.all(listeners);
   }
 
   addresses() {
-    return { viewer: this.viewerHttp.address(), agent: this.agentHttp.address() };
+    return { viewer: this.viewerHttp.address(), agent: this.agentHttp.address(), door: this.doorHttp.listening ? this.doorHttp.address() : null };
   }
 
   async close() {
     const agents = [...this.agents.values()].flatMap((sockets) => [...sockets]);
     for (const socket of [...agents, ...this.viewers]) socket.terminate();
     await Promise.all(agents.map((socket) => this.agentClosures.get(socket)));
-    await this.store.writeQueue;
-    await Promise.all([this.agentHttp, this.viewerHttp].map((server) => new Promise((resolve) => server.close(resolve))));
+    await Promise.all([this.store.writeQueue, this.virtual.writeQueue]);
+    for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
+    await Promise.all([this.agentHttp, this.viewerHttp, this.doorHttp].filter((server) => server.listening).map((server) => new Promise((resolve) => server.close(resolve))));
   }
 
   broadcast(value) {
@@ -183,6 +197,7 @@ export class InboxHub {
         if (!sockets.size) {
           this.agents.delete(host.id);
           await this.store.setHostOnline(host.id, false);
+          await this.virtual.hostOffline(host.id);
         }
         this.broadcastState();
       } finally {
@@ -191,6 +206,7 @@ export class InboxHub {
       }
     });
     await this.store.setHostOnline(host.id, true);
+    if (host.paired) await this.virtual.ensureLinked(host);
     socketSend(socket, host.paired ? { type: "paired" } : { type: "pairing_required", pairingCode: host.pairingCode });
     this.broadcastState();
   }
@@ -210,6 +226,7 @@ export class InboxHub {
         this.broadcastState();
       }
       this.broadcast({ type: "session", session });
+      await this.virtual.changed(session);
       return;
     }
     const session = this.store.getSession(key);
@@ -254,13 +271,13 @@ export class InboxHub {
       this.broadcastState();
       return;
     }
-    if (message.type === "reply_result") {
+    if (message.type === "reply_result" || message.type === "stop_result") {
       const pending = this.pendingReplies.get(message.requestId);
       if (!pending) return;
       this.pendingReplies.delete(message.requestId);
       clearTimeout(pending.timeout);
       if (message.ok) await this.store.resolveSessionInbox(key);
-      socketSend(pending.viewer, { type: "reply_result", requestId: message.requestId, ok: Boolean(message.ok), error: message.error });
+      pending.resolve({ ok: Boolean(message.ok), error: message.error });
       this.broadcastState();
       return;
     }
@@ -299,27 +316,66 @@ export class InboxHub {
     socket.on("close", () => this.viewers.delete(socket));
   }
 
-  async handleViewerReply(viewer, message) {
-    const key = requireString(message.sessionKey, "sessionKey", 500);
-    const requestId = requireString(message.requestId, "requestId", 100);
-    if (this.pendingReplies.has(requestId)) throw new Error("Duplicate reply request");
-    const text = requireString(message.text, "text", 32_000);
-    const generation = requireString(message.generation, "generation", 100);
+  agentRoute(key, generation) {
     const session = this.store.getSession(key);
     if (!session || !session.online || session.generation !== generation) throw new Error("Session is offline or changed");
     const host = this.store.getHost(session.hostId);
     const route = this.sessionAgents.get(key);
     const agent = route?.generation === generation ? route.socket : undefined;
     if (!host?.paired || !agent || agent.readyState !== WebSocket.OPEN) throw new Error("Session is offline");
-    const timeout = setTimeout(() => {
-      const pending = this.pendingReplies.get(requestId);
-      if (!pending) return;
-      this.pendingReplies.delete(requestId);
-      socketSend(viewer, { type: "reply_result", requestId, ok: false, error: "Delivery result unknown" });
-    }, 15_000);
-    timeout.unref();
-    this.pendingReplies.set(requestId, { viewer, timeout });
-    socketSend(agent, { type: "reply", requestId, sessionId: session.sessionId, generation, text });
+    return { session, agent };
+  }
+
+  requestAgent(key, generation, requestId, message) {
+    if (this.pendingReplies.has(requestId)) return Promise.reject(new Error("Duplicate request"));
+    const { agent } = this.agentRoute(key, generation);
+    const result = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingReplies.delete(requestId);
+        reject(new Error("Delivery result unknown"));
+      }, 15_000);
+      timeout.unref();
+      this.pendingReplies.set(requestId, { resolve, reject, timeout });
+    });
+    socketSend(agent, message);
+    return result.then((result) => {
+      if (!result.ok) throw new Error(result.error || "Agent request failed");
+      return result;
+    });
+  }
+
+  deliverReply({ key, generation, requestId, text, attachments = [] }) {
+    requireString(text, "text", 32_000);
+    const { session } = this.agentRoute(key, generation);
+    return this.requestAgent(key, generation, requestId, {
+      type: "reply",
+      requestId,
+      sessionId: session.sessionId,
+      generation,
+      text,
+      attachments: attachments.map((attachment) => ({
+        name: attachment.name,
+        mimeType: attachment.mimeType || attachment.mime_type || "application/octet-stream",
+        data: Buffer.from(attachment.data || "", attachment.data instanceof Buffer ? undefined : "base64").toString("base64")
+      }))
+    });
+  }
+
+  stopSession({ key, generation, requestId }) {
+    const { session } = this.agentRoute(key, generation);
+    return this.requestAgent(key, generation, requestId, { type: "stop", requestId, sessionId: session.sessionId, generation });
+  }
+
+  async handleViewerReply(viewer, message) {
+    const key = requireString(message.sessionKey, "sessionKey", 500);
+    const requestId = requireString(message.requestId, "requestId", 100);
+    const generation = requireString(message.generation, "generation", 100);
+    try {
+      await this.deliverReply({ key, generation, requestId, text: message.text });
+      socketSend(viewer, { type: "reply_result", requestId, ok: true });
+    } catch (error) {
+      socketSend(viewer, { type: "reply_result", requestId, ok: false, error: error.message });
+    }
   }
 
   async handleViewerHttp(request, response) {
@@ -347,6 +403,7 @@ export class InboxHub {
         if (hostMatch[2] === "approve") {
           const host = await this.store.approveHost(hostId);
           for (const socket of this.agents.get(hostId) ?? []) socketSend(socket, { type: "paired" });
+          await this.virtual.ensureLinked(host);
           this.broadcastState();
           return sendJson(response, 200, { ok: true, paired: host.paired });
         }
@@ -361,6 +418,7 @@ export class InboxHub {
         this.broadcastState();
         return sendJson(response, 200, { ok: true });
       }
+      if (this.plannotator && !PUBLIC_FILES.has(url.pathname) && !url.pathname.startsWith("/session/")) return this.plannotator.proxy(request, response);
       if (request.method !== "GET" && request.method !== "HEAD") return sendJson(response, 404, { error: "Not found" });
       const filename = PUBLIC_FILES.get(url.pathname) ?? (url.pathname.startsWith("/session/") ? "index.html" : undefined);
       if (!filename) return sendJson(response, 404, { error: "Not found" });
@@ -375,17 +433,28 @@ export class InboxHub {
 
 async function main() {
   const publicUrl = process.env.PUBLIC_URL ?? "http://127.0.0.1:8091";
+  const dataDir = process.env.DATA_DIR ?? path.resolve("data");
+  const virtualAddress = process.env.VIRTUAL_MACHINE_ADDRESS;
+  const plannotator = process.env.PLANNOTATOR_DISABLED === "1" ? null : await new PlannotatorRuntime({
+    binary: process.env.PLANNOTATOR_BINARY,
+    dataDir: path.join(dataDir, "plannotator"),
+    virtualAddress
+  }).start();
   const hub = await InboxHub.create({
-    dataDir: process.env.DATA_DIR ?? path.resolve("data"),
+    dataDir,
     publicDir: path.resolve("public"),
-    publicUrl
+    publicUrl,
+    plannotator,
+    virtualAddress,
+    linkMachine: plannotator ? (code) => plannotator.link(code) : undefined
   });
   const host = process.env.HOST ?? "127.0.0.1";
-  await hub.listen({ viewerPort: Number(process.env.VIEWER_PORT ?? 8091), agentPort: Number(process.env.AGENT_PORT ?? 8092), host });
+  await hub.listen({ viewerPort: Number(process.env.VIEWER_PORT ?? 8091), agentPort: Number(process.env.AGENT_PORT ?? 8092), doorPort: process.env.DOOR_PORT ? Number(process.env.DOOR_PORT) : undefined, host });
   console.log(`Pi Inbox viewer: ${publicUrl}`);
   console.log(`Pi Inbox agent relay listening on ${host}:${hub.addresses().agent.port}`);
   const shutdown = async () => {
     await hub.close();
+    await plannotator?.stop();
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
