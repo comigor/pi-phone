@@ -58,7 +58,7 @@ Configuration:
 5. Open a session and answer from the composer.
 6. Choose **Alerts** in the installed PWA to enable push notifications on that device.
 
-When the last Pi process on a host exits, its sessions become offline. There is intentionally no supervisor or remote-start daemon.
+When the last Pi process on a host exits, its sessions become offline. Agents ping every 20 seconds; the relay terminates connections after 60 seconds without a message. There is intentionally no supervisor or remote-start daemon.
 
 ## Current limitation
 

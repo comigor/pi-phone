@@ -215,3 +215,37 @@ test("simultaneous Pi processes on one host stay connected", async (t) => {
   const state = await (await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/state`)).json();
   assert.equal(state.hosts.find((host) => host.id === agentIdentity.hostId).online, true);
  });
+
+test("inactive agent connections expire after missed heartbeats", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-"));
+  const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost", agentHeartbeatTimeoutMs: 40, agentHeartbeatCheckMs: 10 });
+  await hub.listen({ viewerPort: 0, agentPort: 0, host: "127.0.0.1" });
+  const agentIdentity = identity();
+  const agent = await connectAgent(hub.addresses().agent, agentIdentity);
+  const viewer = await openSocket(`ws://127.0.0.1:${hub.addresses().viewer.port}/ws`);
+  t.after(async () => {
+    viewer.socket.terminate();
+    agent.socket.terminate();
+    await hub.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  await agent.next((message) => message.type === "pairing_required");
+  await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await agent.next((message) => message.type === "paired");
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  agent.socket.send(JSON.stringify({ type: "session_upsert", sessionId, generation, session: { sessionId, generation, cwd: "/tmp/heartbeat", name: "heartbeat", status: "idle", messages: [] } }));
+  await viewer.next((message) => message.type === "session" && message.session?.sessionId === sessionId);
+
+  const keepalive = setInterval(() => agent.socket.send(JSON.stringify({ type: "ping" })), 15);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  clearInterval(keepalive);
+  assert.equal(agent.socket.readyState, WebSocket.OPEN);
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Agent did not expire")), 1000);
+    agent.socket.once("close", () => { clearTimeout(timeout); resolve(); });
+  });
+  const offline = await viewer.next((message) => message.type === "state" && message.hosts.find((host) => host.id === agentIdentity.hostId)?.online === false);
+  assert.equal(offline.sessions.find((session) => session.sessionId === sessionId).online, false);
+});

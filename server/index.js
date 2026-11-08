@@ -57,6 +57,8 @@ export class InboxHub {
     this.publicUrl = options.publicUrl;
     this.store = options.store;
     this.push = options.push;
+    this.agentHeartbeatTimeoutMs = options.agentHeartbeatTimeoutMs ?? 60_000;
+    this.agentHeartbeatCheckMs = options.agentHeartbeatCheckMs ?? 10_000;
     this.agents = new Map();
     this.sessionAgents = new Map();
     this.agentClosures = new Map();
@@ -152,7 +154,13 @@ export class InboxHub {
     this.agents.set(host.id, sockets);
     let markClosed;
     this.agentClosures.set(socket, new Promise((resolve) => { markClosed = resolve; }));
+    let lastSeenAt = Date.now();
+    const heartbeat = setInterval(() => {
+      if (Date.now() - lastSeenAt >= this.agentHeartbeatTimeoutMs) socket.terminate();
+    }, this.agentHeartbeatCheckMs);
+    heartbeat.unref();
     socket.on("message", async (raw) => {
+      lastSeenAt = Date.now();
       try {
         const message = parseMessage(raw);
         if (!message) return socketSend(socket, { type: "error", error: "Invalid message" });
@@ -163,6 +171,7 @@ export class InboxHub {
       }
     });
     socket.on("close", async () => {
+      clearInterval(heartbeat);
       try {
         const sockets = this.agents.get(host.id);
         if (!sockets?.delete(socket)) return;
