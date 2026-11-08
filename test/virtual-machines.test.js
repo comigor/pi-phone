@@ -170,7 +170,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const persistedMessages = [
     { id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] },
     { id: "user-continue", role: "user", text: "Continue remotely", images: [] },
-    { id: "user-image", role: "user", text: "Inspect this image\n\n[Image: original 1x1, displayed at 1x1.]", images: [{ data: png.toString("base64"), mimeType: "image/png" }] },
+    { id: "user-image", role: "user", text: "Inspect this image\n\n[Image: original 1x1, displayed at 1x1.]", images: [{ data: Buffer.from("transcoded-jpeg").toString("base64"), mimeType: "image/jpeg" }] },
     { id: "assistant-2", role: "assistant", text: "Image answer", images: [] }
   ];
   const publishPersisted = (status) => agent.send(JSON.stringify({

@@ -88,13 +88,6 @@ function attachmentFor(session, message, attachment, index) {
   };
 };
 
-function attachmentBase64(data) {
-  if (typeof data === "string") return Buffer.from(data, "base64").toString("base64");
-  if (Buffer.isBuffer(data) || data instanceof Uint8Array) return Buffer.from(data).toString("base64");
-  if (data?.type === "Buffer" && Array.isArray(data.data)) return Buffer.from(data.data).toString("base64");
-  return "";
-}
-
 function matchesPersistedReply(message, reply) {
   if (message.role !== "user" || typeof message.text !== "string") return false;
   const attachments = reply.attachments || [];
@@ -106,7 +99,7 @@ function matchesPersistedReply(message, reply) {
     (expectedFiles > 0 && message.text.startsWith(`${reply.text}\n\nAttached files:\n`));
   if (!textMatches) return false;
   const images = message.images || [];
-  return images.length === expectedImages.length && expectedImages.every((item, index) => attachmentBase64(item.data) === attachmentBase64(images[index]?.data));
+  return images.length === expectedImages.length;
 }
 
 export class VirtualMachines {
