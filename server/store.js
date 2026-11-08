@@ -103,6 +103,13 @@ export class InboxStore {
     await this.persist();
   }
 
+  async setSessionOffline(key, generation) {
+    const session = this.getSession(key);
+    if (!session || session.generation !== generation || !session.online) return;
+    session.online = false;
+    await this.persist();
+  }
+
   async upsertSession(hostId, incoming) {
     const key = sessionKey(hostId, incoming.sessionId);
     let session = this.state.sessions.find((item) => item.key === key);

@@ -58,6 +58,8 @@ export class InboxHub {
     this.store = options.store;
     this.push = options.push;
     this.agents = new Map();
+    this.sessionAgents = new Map();
+    this.agentClosures = new Map();
     this.viewers = new Set();
     this.challenges = new Map();
     this.pendingReplies = new Map();
@@ -91,7 +93,10 @@ export class InboxHub {
   }
 
   async close() {
-    for (const socket of [...this.agents.values(), ...this.viewers]) socket.terminate();
+    const agents = [...this.agents.values()].flatMap((sockets) => [...sockets]);
+    for (const socket of [...agents, ...this.viewers]) socket.terminate();
+    await Promise.all(agents.map((socket) => this.agentClosures.get(socket)));
+    await this.store.writeQueue;
     await Promise.all([this.agentHttp, this.viewerHttp].map((server) => new Promise((resolve) => server.close(resolve))));
   }
 
@@ -142,12 +147,11 @@ export class InboxHub {
   }
 
   async handleAgentSocket(socket, host) {
-    const previous = this.agents.get(host.id);
-    if (previous) previous.terminate();
-    this.agents.set(host.id, socket);
-    await this.store.setHostOnline(host.id, true);
-    socketSend(socket, host.paired ? { type: "paired" } : { type: "pairing_required", pairingCode: host.pairingCode });
-    this.broadcastState();
+    const sockets = this.agents.get(host.id) ?? new Set();
+    sockets.add(socket);
+    this.agents.set(host.id, sockets);
+    let markClosed;
+    this.agentClosures.set(socket, new Promise((resolve) => { markClosed = resolve; }));
     socket.on("message", async (raw) => {
       try {
         const message = parseMessage(raw);
@@ -159,11 +163,27 @@ export class InboxHub {
       }
     });
     socket.on("close", async () => {
-      if (this.agents.get(host.id) !== socket) return;
-      this.agents.delete(host.id);
-      await this.store.setHostOnline(host.id, false);
-      this.broadcastState();
+      try {
+        const sockets = this.agents.get(host.id);
+        if (!sockets?.delete(socket)) return;
+        for (const [sessionKey, route] of this.sessionAgents) {
+          if (route.socket !== socket) continue;
+          this.sessionAgents.delete(sessionKey);
+          await this.store.setSessionOffline(sessionKey, route.generation);
+        }
+        if (!sockets.size) {
+          this.agents.delete(host.id);
+          await this.store.setHostOnline(host.id, false);
+        }
+        this.broadcastState();
+      } finally {
+        this.agentClosures.delete(socket);
+        markClosed();
+      }
     });
+    await this.store.setHostOnline(host.id, true);
+    socketSend(socket, host.paired ? { type: "paired" } : { type: "pairing_required", pairingCode: host.pairingCode });
+    this.broadcastState();
   }
 
   async handleAgentMessage(host, socket, message) {
@@ -175,6 +195,7 @@ export class InboxHub {
       requireString(message.session?.generation, "generation", 100);
       if (message.session.generation !== generation || message.session.sessionId !== sessionId) throw new Error("Session identity mismatch");
       const session = await this.store.upsertSession(host.id, message.session);
+      this.sessionAgents.set(key, { socket, generation });
       if (session.status === "running") {
         await this.store.resolveSessionInbox(key);
         this.broadcastState();
@@ -278,8 +299,9 @@ export class InboxHub {
     const session = this.store.getSession(key);
     if (!session || !session.online || session.generation !== generation) throw new Error("Session is offline or changed");
     const host = this.store.getHost(session.hostId);
-    const agent = this.agents.get(session.hostId);
-    if (!host?.paired || !agent || agent.readyState !== WebSocket.OPEN) throw new Error("Host is offline");
+    const route = this.sessionAgents.get(key);
+    const agent = route?.generation === generation ? route.socket : undefined;
+    if (!host?.paired || !agent || agent.readyState !== WebSocket.OPEN) throw new Error("Session is offline");
     const timeout = setTimeout(() => {
       const pending = this.pendingReplies.get(requestId);
       if (!pending) return;
@@ -315,12 +337,12 @@ export class InboxHub {
         const hostId = decodeURIComponent(hostMatch[1]);
         if (hostMatch[2] === "approve") {
           const host = await this.store.approveHost(hostId);
-          socketSend(this.agents.get(hostId), { type: "paired" });
+          for (const socket of this.agents.get(hostId) ?? []) socketSend(socket, { type: "paired" });
           this.broadcastState();
           return sendJson(response, 200, { ok: true, paired: host.paired });
         }
         await this.store.revokeHost(hostId);
-        this.agents.get(hostId)?.close();
+        for (const socket of this.agents.get(hostId) ?? []) socket.close();
         this.broadcastState();
         return sendJson(response, 200, { ok: true });
       }

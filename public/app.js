@@ -189,36 +189,57 @@ function send(message) {
 
 function handleMessage(message) {
   if (message.type === "state") {
+    const previous = state.selectedSession;
     Object.assign(state, { hosts: message.hosts, sessions: message.sessions, inbox: message.inbox });
-    if (state.selectedKey) state.selectedSession = message.sessions.find((item) => item.key === state.selectedKey);
-  } else if (message.type === "session" && message.session) {
+    if (state.selectedKey) {
+      const selected = message.sessions.find((item) => item.key === state.selectedKey);
+      state.selectedSession = selected ? { ...selected, messages: previous?.messages } : undefined;
+    }
+    renderSidebar();
+    if (state.selectedKey && (!previous || !state.selectedSession || previous.online !== state.selectedSession.online || previous.status !== state.selectedSession.status)) renderMain();
+    return;
+  }
+  if (message.type === "session" && message.session) {
     const index = state.sessions.findIndex((item) => item.key === message.session.key);
     if (index >= 0) state.sessions[index] = { ...state.sessions[index], ...message.session };
     else state.sessions.push(message.session);
+    renderSidebar();
     if (state.selectedKey === message.session.key) {
+      const previous = state.selectedSession;
       state.selectedSession = message.session;
       state.streamingText = "";
+      if (previous?.online !== message.session.online || previous?.status !== message.session.status || previous?.messages?.length !== message.session.messages?.length) renderMain();
     }
-  } else if (message.type === "session_event" && message.sessionKey === state.selectedKey) {
+    return;
+  }
+  if (message.type === "session_event") {
+    if (message.sessionKey !== state.selectedKey) return;
     const update = message.event?.assistantMessageEvent;
     if (update?.type === "text_delta") {
       state.streamingText += update.delta;
       renderStreaming();
     }
     return;
-  } else if (message.type === "inbox") {
+  }
+  if (message.type === "inbox") {
     const index = state.inbox.findIndex((item) => item.id === message.item.id);
     if (index >= 0) state.inbox[index] = message.item;
     else state.inbox.unshift(message.item);
-  } else if (message.type === "reply_result") {
+    renderSidebar();
+    return;
+  }
+  if (message.type === "reply_result") {
     state.sending = false;
     if (message.ok) drafts.delete(state.selectedKey);
     else toast(message.error || "Reply was not delivered");
-  } else if (message.type === "error") {
+    renderMain();
+    return;
+  }
+  if (message.type === "error") {
     state.sending = false;
     toast(message.error);
+    if (state.selectedKey) renderMain();
   }
-  render();
 }
 
 function connect() {

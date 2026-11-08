@@ -166,3 +166,52 @@ test("paired host publishes an inbox item and receives a live reply", async (t) 
   const error = await agent.next((message) => message.type === "error");
   assert.equal(error.error, "Invalid message");
 });
+
+test("simultaneous Pi processes on one host stay connected", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-"));
+  const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, host: "127.0.0.1" });
+  const agentIdentity = identity();
+  const first = await connectAgent(hub.addresses().agent, agentIdentity);
+  await first.next((message) => message.type === "pairing_required");
+  await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await first.next((message) => message.type === "paired");
+  const second = await connectAgent(hub.addresses().agent, agentIdentity);
+  const viewer = await openSocket(`ws://127.0.0.1:${hub.addresses().viewer.port}/ws`);
+  t.after(async () => {
+    viewer.socket.terminate();
+    first.socket.terminate();
+    second.socket.terminate();
+    await hub.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  await second.next((message) => message.type === "paired");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(first.socket.readyState, WebSocket.OPEN);
+  assert.equal(second.socket.readyState, WebSocket.OPEN);
+  const publish = async (agent, sessionId) => {
+    const generation = randomUUID();
+    agent.socket.send(JSON.stringify({
+      type: "session_upsert",
+      sessionId,
+      generation,
+      session: { sessionId, generation, cwd: `/tmp/${sessionId}`, name: sessionId, status: "idle", messages: [] }
+    }));
+    await viewer.next((message) => message.type === "session" && message.session?.key === `${agentIdentity.hostId}:${sessionId}`);
+    return generation;
+  };
+  const firstGeneration = await publish(first, "first-session");
+  const secondGeneration = await publish(second, "second-session");
+  viewer.socket.send(JSON.stringify({ type: "reply", requestId: "first-reply", sessionKey: `${agentIdentity.hostId}:first-session`, generation: firstGeneration, text: "for first" }));
+  const firstDelivery = await first.next((message) => message.type === "reply" && message.requestId === "first-reply");
+  assert.equal(firstDelivery.text, "for first");
+  viewer.socket.send(JSON.stringify({ type: "reply", requestId: "second-reply", sessionKey: `${agentIdentity.hostId}:second-session`, generation: secondGeneration, text: "for second" }));
+  const secondDelivery = await second.next((message) => message.type === "reply" && message.requestId === "second-reply");
+  assert.equal(secondDelivery.text, "for second");
+
+  first.socket.close();
+  await new Promise((resolve) => first.socket.once("close", resolve));
+  const state = await (await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/state`)).json();
+  assert.equal(state.hosts.find((host) => host.id === agentIdentity.hostId).online, true);
+ });
