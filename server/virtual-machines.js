@@ -89,6 +89,7 @@ export class VirtualMachines {
     this.file = path.join(options.dataDir, "virtual-machines.json");
     this.machines = new Map();
     this.streams = new Map();
+    this.linkRetries = new Map();
     this.uploads = new Map();
     this.writeQueue = Promise.resolve();
   }
@@ -138,9 +139,20 @@ export class VirtualMachines {
     try {
       await this.linkMachine(offered.link);
       offered.machine.linkedAt = new Date().toISOString();
+      clearTimeout(this.linkRetries.get(host.id));
+      this.linkRetries.delete(host.id);
       await this.persist();
       return true;
     } catch {
+      if (!this.linkRetries.has(host.id)) {
+        const retry = setTimeout(() => {
+          this.linkRetries.delete(host.id);
+          const current = this.store.getHost(host.id);
+          if (current) void this.ensureLinked(current);
+        }, 5_000);
+        retry.unref();
+        this.linkRetries.set(host.id, retry);
+      }
       return false;
     }
   }

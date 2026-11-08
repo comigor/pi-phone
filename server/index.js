@@ -111,6 +111,7 @@ export class InboxHub {
     const agents = [...this.agents.values()].flatMap((sockets) => [...sockets]);
     for (const socket of [...agents, ...this.viewers]) socket.terminate();
     await Promise.all(agents.map((socket) => this.agentClosures.get(socket)));
+    for (const retry of this.virtual.linkRetries.values()) clearTimeout(retry);
     await Promise.all([this.store.writeQueue, this.virtual.writeQueue]);
     for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
     await Promise.all([this.agentHttp, this.viewerHttp, this.doorHttp].filter((server) => server.listening).map((server) => new Promise((resolve) => server.close(resolve))));
