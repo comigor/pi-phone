@@ -255,7 +255,7 @@ export class VirtualMachines {
       questions: { open: 0, picked: 0, stopped: false, holds_up: [], prompt: null, actions: 0 },
       waiting_on_person: waiting,
       unsent: null,
-      delivery: session.online ? { state: session.status === "running" ? "running" : "idle" } : null,
+      delivery: null,
       agent_after_archive: false,
       back_from_archive: false,
       read_at: session.readAt || null,

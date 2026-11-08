@@ -119,6 +119,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     const model = await (await fetch(`${central}/api/inbox/threads?machines=1`)).json();
     return model.sections.flatMap((section) => section.threads).find((row) => row.subject === "contract-session" && row.machine === machine.id);
   });
+  assert.ok(listed.delivery === null || ["delivered", "undelivered", "saved", "sending", "queued"].includes(listed.delivery.state));
   const forwardedBase = `${central}/api/inbox/m/${machine.id}`;
   const opened = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
   assert.equal(opened.thread.messages[0].body, "Remote assistant");
