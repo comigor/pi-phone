@@ -90,12 +90,12 @@ function attachmentFor(session, message, attachment, index) {
 
 function matchesPersistedReply(message, reply) {
   if (message.role !== "user" || typeof message.text !== "string") return false;
+  if (message.text === reply.text) return true;
   const attachments = reply.attachments || [];
-  if (!attachments.length) return message.text === reply.text;
+  if (!attachments.length) return false;
   const expectedImages = attachments.filter((item) => item.mimeType?.startsWith("image/"));
   const expectedFiles = attachments.length - expectedImages.length;
-  const textMatches = message.text === reply.text ||
-    (expectedImages.length > 0 && message.text.startsWith(`${reply.text}\n\n[Image:`)) ||
+  const textMatches = (expectedImages.length > 0 && message.text.startsWith(`${reply.text}\n\n[Image:`)) ||
     (expectedFiles > 0 && message.text.startsWith(`${reply.text}\n\nAttached files:\n`));
   if (!textMatches) return false;
   const images = message.images || [];

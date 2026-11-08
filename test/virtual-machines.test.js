@@ -9,6 +9,7 @@ import WebSocket from "ws";
 import { InboxHub } from "../server/index.js";
 import { PlannotatorRuntime } from "../server/plannotator.js";
 import { agentSignaturePayload } from "../server/protocol.js";
+import { VirtualMachines } from "../server/virtual-machines.js";
 
 const binary = process.env.PLANNOTATOR_TEST_BINARY || "plannotator";
 const available = spawnSync("sh", ["-c", `command -v ${binary}`], { stdio: "ignore" }).status === 0;
@@ -61,6 +62,21 @@ function nextMessage(socket, type, timeoutMs = 10_000) {
     socket.on("message", listener);
   });
 }
+
+test("legacy text-only image replies stay in their original position", () => {
+  const virtual = new VirtualMachines({ dataDir: "/tmp" });
+  const session = {
+    key: "host:session", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z",
+    messages: [
+      { id: "user", role: "user", text: "this message should have an image", images: [] },
+      { id: "assistant", role: "assistant", text: "Current answer", images: [] }
+    ],
+    remoteReplies: [{ id: "relay:legacy", role: "user", text: "this message should have an image", attachments: [{ data: Buffer.from("old-png"), mimeType: "image/png" }] }]
+  };
+  const messages = virtual.messagesFor(session);
+  assert.deepEqual(messages.map((message) => message.body), ["this message should have an image", "Current answer"]);
+  assert.equal(messages[0].id, virtual.virtualMessage(session, session.remoteReplies[0], 0).id);
+});
 
 test("an unchanged Plannotator links to a virtual Pi host and controls its session", { skip: !available, timeout: 60_000 }, async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-virtual-"));
