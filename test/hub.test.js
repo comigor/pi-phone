@@ -136,6 +136,32 @@ test("paired host publishes an inbox item and receives a live reply", async (t) 
   const finalState = await (await fetch(`${viewerBase}/api/state`)).json();
   assert.equal(finalState.inbox.find((item) => item.id === inbox.item.id).status, "answered");
 
+  agent.socket.send(JSON.stringify({ type: "agent_settled", sessionId, generation, runId: "run-2", aborted: false }));
+  const locallyAnswered = await viewer.next((message) => message.type === "inbox" && message.item.id === `${sessionKey}:run-2`);
+  assert.equal(locallyAnswered.item.status, "pending");
+
+  agent.socket.send(JSON.stringify({
+    type: "session_upsert",
+    sessionId,
+    generation,
+    session: {
+      sessionId,
+      generation,
+      cwd: "/workspace/example",
+      name: "example",
+      model: "test/model",
+      thinkingLevel: "high",
+      status: "running",
+      messages: [
+        { id: "m1", role: "assistant", text: "Should I continue?", toolCalls: [] },
+        { id: "m2", role: "user", text: "Answered directly in Pi", toolCalls: [] }
+      ]
+    }
+  }));
+  await viewer.next((message) => message.type === "session" && message.session?.key === sessionKey && message.session.status === "running");
+  const runningState = await (await fetch(`${viewerBase}/api/state`)).json();
+  assert.equal(runningState.inbox.find((item) => item.id === locallyAnswered.item.id).status, "answered");
+
   agent.socket.send("not-json");
   const error = await agent.next((message) => message.type === "error");
   assert.equal(error.error, "Invalid message");

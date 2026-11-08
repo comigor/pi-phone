@@ -1,4 +1,4 @@
-const state = { hosts: [], sessions: [], inbox: [], view: "inbox", selectedKey: undefined, selectedSession: undefined, streamingText: "", sending: false };
+const state = { hosts: [], sessions: [], inbox: [], view: "inbox", inboxFilter: "pending", selectedKey: undefined, selectedSession: undefined, streamingText: "", sending: false };
 const drafts = new Map();
 const sidebar = document.querySelector("#sidebar-content");
 const main = document.querySelector("#main");
@@ -48,16 +48,19 @@ function selectSession(key) {
 
 function renderSidebar() {
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === state.view));
+  document.querySelector("#inbox-filter").hidden = state.view !== "inbox";
+  document.querySelectorAll("[data-filter]").forEach((button) => button.classList.toggle("active", button.dataset.filter === state.inboxFilter));
   const pending = state.inbox.filter((item) => item.status === "pending");
   document.querySelector("#inbox-count").textContent = pending.length;
   document.querySelector("#agent-count").textContent = state.sessions.filter((item) => item.online).length;
   sidebar.replaceChildren();
   if (state.view === "inbox") {
-    if (!state.inbox.length) {
-      sidebar.append(element("div", "empty", "No agent updates yet."));
+    const items = state.inboxFilter === "pending" ? pending : state.inbox;
+    if (!items.length) {
+      sidebar.append(element("div", "empty", state.inboxFilter === "pending" ? "No unanswered messages." : "No agent updates yet."));
       return;
     }
-    for (const item of state.inbox) {
+    for (const item of items) {
       const host = state.hosts.find((entry) => entry.id === item.hostId);
       const button = element("button", "card-button");
       button.append(element("div", "card-title", item.project));
@@ -260,6 +263,10 @@ async function enableNotifications() {
 }
 
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
+document.querySelectorAll("[data-filter]").forEach((button) => button.addEventListener("click", () => {
+  state.inboxFilter = button.dataset.filter;
+  renderSidebar();
+}));
 document.querySelector("#home").addEventListener("click", () => setView("inbox"));
 document.querySelector("#notifications").addEventListener("click", enableNotifications);
 if (location.pathname.startsWith("/session/")) {

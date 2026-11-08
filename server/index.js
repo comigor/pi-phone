@@ -175,6 +175,10 @@ export class InboxHub {
       requireString(message.session?.generation, "generation", 100);
       if (message.session.generation !== generation || message.session.sessionId !== sessionId) throw new Error("Session identity mismatch");
       const session = await this.store.upsertSession(host.id, message.session);
+      if (session.status === "running") {
+        await this.store.resolveSessionInbox(key);
+        this.broadcastState();
+      }
       this.broadcast({ type: "session", session });
       return;
     }
