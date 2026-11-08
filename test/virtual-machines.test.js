@@ -167,20 +167,26 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const imageReplyBody = await imageReplyResult.json();
   const uploadedImage = imageReplyBody.reply.attachments[0];
   assert.equal(uploadedImage.mime_type, "image/png");
-  agent.send(JSON.stringify({
+  const persistedMessages = [
+    { id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] },
+    { id: "user-continue", role: "user", text: "Continue remotely", images: [] },
+    { id: "user-image", role: "user", text: "Inspect this image\n\n[Image: original 1x1, displayed at 1x1.]", images: [{ data: png.toString("base64"), mimeType: "image/png" }] },
+    { id: "assistant-2", role: "assistant", text: "Image answer", images: [] }
+  ];
+  const publishPersisted = (status) => agent.send(JSON.stringify({
     type: "session_upsert", sessionId, generation,
-    session: {
-      sessionId, generation, cwd: "/workspace/contract", name: "contract-session", model: "test/model", status: "running",
-      messages: [
-        { id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] },
-        { id: "user-image", role: "user", text: "Inspect this image", images: [] }
-      ]
-    }
+    session: { sessionId, generation, cwd: "/workspace/contract", name: "contract-session", model: "test/model", status, messages: persistedMessages }
   }));
-  await waitFor(async () => {
+  publishPersisted("idle");
+  const reconciledImage = await waitFor(async () => {
     const model = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
-    return model.thread.messages.some((message) => message.body === "Inspect this image" && message.id !== imageReplyBody.reply.id) ? model : null;
+    const conversation = model.thread.messages.filter((message) => message.seq > 0);
+    const copies = conversation.filter((message) => message.body.startsWith("Inspect this image"));
+    return copies.length === 1 && conversation.at(-1)?.body === "Image answer" ? model : null;
   });
+  assert.equal(reconciledImage.thread.messages.filter((message) => message.body.startsWith("Inspect this image")).length, 1);
+  publishPersisted("running");
+  await waitFor(async () => (await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json()).thread.messages.some((message) => message.body.includes("Stop agent")));
   const persistedImage = await fetch(`${forwardedBase}/attachments/${uploadedImage.id}/image`);
   assert.equal(persistedImage.status, 200);
   assert.equal(Buffer.from(await persistedImage.arrayBuffer()).toString("base64"), png.toString("base64"));
