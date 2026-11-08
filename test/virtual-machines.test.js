@@ -184,6 +184,18 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const persistedImage = await fetch(`${forwardedBase}/attachments/${uploadedImage.id}/image`);
   assert.equal(persistedImage.status, 200);
   assert.equal(Buffer.from(await persistedImage.arrayBuffer()).toString("base64"), png.toString("base64"));
+  const beforeImageOnly = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
+  const imageOnlyDelivery = nextMessage(agent, "reply");
+  const imageOnlyResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "image-only-contract", words: "", seen_through_seq: beforeImageOnly.cursor, uploads: [uploaded.upload_id] })
+  });
+  const imageOnly = await imageOnlyDelivery;
+  assert.equal(imageOnly.text, "Image attached");
+  assert.equal(imageOnly.attachments[0].mimeType, "image/png");
+  agent.send(JSON.stringify({ type: "reply_result", requestId: imageOnly.requestId, sessionId, generation, ok: true }));
+  assert.equal((await imageOnlyResponse).status, 200);
 
   const annotationResponse = await fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/annotations`, {
     method: "POST",

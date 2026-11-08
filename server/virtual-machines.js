@@ -501,12 +501,13 @@ export class VirtualMachines {
     const key = requireKey(body.idempotency_key);
     const words = compose ? body.body : body.words;
     const feedback = typeof body.feedback === "string" ? body.feedback.trim() : "";
-    if ((typeof words !== "string" && !feedback) || (typeof words === "string" && !words.trim() && !feedback)) {
-      return send(response, 422, { code: "validation_error", error: "Message text or feedback is required" });
-    }
-    const text = [typeof words === "string" ? words.trim() : "", feedback].filter(Boolean).join("\n\n");
-    if (!compose && body.seen_through_seq !== session.virtualCursor) return send(response, 409, { code: "thread_moved_on", error: "Read the latest thread before replying" });
     const attachments = (body.uploads || []).map((uploadId) => this.uploads.get(uploadId)).filter(Boolean);
+    if ((typeof words !== "string" && !feedback && attachments.length === 0) || (typeof words === "string" && !words.trim() && !feedback && attachments.length === 0)) {
+      return send(response, 422, { code: "validation_error", error: "Message text, feedback, or an attachment is required" });
+    }
+    const combined = [typeof words === "string" ? words.trim() : "", feedback].filter(Boolean).join("\n\n");
+    const text = combined || (attachments.every((attachment) => attachment.mimeType?.startsWith("image/")) ? "Image attached" : "Files attached");
+    if (!compose && body.seen_through_seq !== session.virtualCursor) return send(response, 409, { code: "thread_moved_on", error: "Read the latest thread before replying" });
     const previous = (session.remoteReplies || []).find((message) => message.requestId === key);
     if (previous) return send(response, 200, { reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
     await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });
