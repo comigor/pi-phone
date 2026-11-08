@@ -62,6 +62,19 @@ export class PlannotatorRuntime {
     }
     const target = new URL(request.url, this.url);
     const headers = { ...request.headers, host: target.host };
+    for (const name of [
+      "forwarded",
+      "x-forwarded-for",
+      "x-forwarded-host",
+      "x-forwarded-port",
+      "x-forwarded-proto",
+      "x-real-ip",
+      "tailscale-user-login",
+      "tailscale-user-name",
+      "tailscale-user-profile-pic",
+      "tailscale-headers-info",
+      "tailscale-funnel-request"
+    ]) delete headers[name];
     if (headers.origin) headers.origin = this.url.origin;
     if (headers.referer) headers.referer = this.url.origin;
     const upstream = (target.protocol === "https:" ? httpsRequest : httpRequest)(target, { method: request.method, headers }, (upstreamResponse) => {

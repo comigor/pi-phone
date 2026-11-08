@@ -172,6 +172,12 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const stopped = await stoppedResponse;
   assert.equal(stopped.status, 200);
 
+  const remoteViewer = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/machines`, {
+    headers: { "x-forwarded-for": "203.0.113.10", forwarded: "for=203.0.113.10", "tailscale-user-login": "remote@example.com" }
+  });
+  assert.equal(remoteViewer.status, 200);
+  assert.doesNotMatch(await remoteViewer.text(), /local_only/);
+
   const viewer = await fetch(`http://127.0.0.1:${addresses.viewer.port}/`);
   assert.equal(viewer.status, 200);
   assert.match(await viewer.text(), /plannotator/i);
