@@ -131,10 +131,18 @@ export class VirtualMachines {
   }
 
   async ensureLinked(host) {
-    if (!this.linkMachine || !host.paired || !host.online) return;
+    const existing = this.machines.get(host.id);
+    if (!this.linkMachine || !host.paired || !host.online || existing?.linkedAt) return Boolean(existing?.linkedAt);
     const offered = this.offer(host);
     await this.persist();
-    await this.linkMachine(offered.link);
+    try {
+      await this.linkMachine(offered.link);
+      offered.machine.linkedAt = new Date().toISOString();
+      await this.persist();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async pair(request, response) {
