@@ -86,6 +86,27 @@ function attachmentFor(session, message, attachment, index) {
     data,
     mimeType
   };
+};
+
+function attachmentBase64(data) {
+  if (typeof data === "string") return Buffer.from(data, "base64").toString("base64");
+  if (Buffer.isBuffer(data) || data instanceof Uint8Array) return Buffer.from(data).toString("base64");
+  if (data?.type === "Buffer" && Array.isArray(data.data)) return Buffer.from(data.data).toString("base64");
+  return "";
+}
+
+function matchesPersistedReply(message, reply) {
+  if (message.role !== "user" || typeof message.text !== "string") return false;
+  const attachments = reply.attachments || [];
+  if (!attachments.length) return message.text === reply.text;
+  const expectedImages = attachments.filter((item) => item.mimeType?.startsWith("image/"));
+  const expectedFiles = attachments.length - expectedImages.length;
+  const textMatches = message.text === reply.text ||
+    (expectedImages.length > 0 && message.text.startsWith(`${reply.text}\n\n[Image:`)) ||
+    (expectedFiles > 0 && message.text.startsWith(`${reply.text}\n\nAttached files:\n`));
+  if (!textMatches) return false;
+  const images = message.images || [];
+  return images.length === expectedImages.length && expectedImages.every((item, index) => attachmentBase64(item.data) === attachmentBase64(images[index]?.data));
 }
 
 export class VirtualMachines {
@@ -240,8 +261,12 @@ export class VirtualMachines {
   }
 
   messagesFor(session) {
-    const seenUserText = new Set(session.messages.filter((message) => message.role === "user").map((message) => message.text));
-    const messages = [...session.messages, ...(session.remoteReplies || []).filter((message) => !seenUserText.has(message.text))];
+    const unmatchedReplies = [...(session.remoteReplies || [])];
+    const messages = session.messages.map((message) => {
+      const index = unmatchedReplies.findIndex((reply) => matchesPersistedReply(message, reply));
+      return index >= 0 ? unmatchedReplies.splice(index, 1)[0] : message;
+    });
+    messages.push(...unmatchedReplies);
     const result = messages.map((message, index) => this.virtualMessage(session, message, index));
     if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) result.push(this.controlMessage(session));
     return result;
