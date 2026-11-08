@@ -3,11 +3,10 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { sessionKey } from "./protocol.js";
 
-const MAX_MESSAGES = 300;
 const MAX_INBOX_ITEMS = 500;
 
 function cleanMessages(messages) {
-  return Array.isArray(messages) ? messages.slice(-MAX_MESSAGES) : [];
+  return Array.isArray(messages) ? messages : [];
 }
 
 function excerpt(value, length = 500) {

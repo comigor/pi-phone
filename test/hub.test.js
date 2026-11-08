@@ -7,6 +7,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import { InboxHub } from "../server/index.js";
 import { agentSignaturePayload, parseMessage } from "../server/protocol.js";
+import { InboxStore } from "../server/store.js";
 
 function messageQueue(socket) {
   const messages = [];
@@ -69,6 +70,22 @@ function identity() {
 test("invalid protocol input is rejected without throwing", () => {
   for (const input of ["", "null", "[]", "{}", "not-json", Buffer.from("{")]) assert.equal(parseMessage(input), null);
   assert.deepEqual(parseMessage('{"type":"ping"}'), { type: "ping" });
+});
+
+test("session history keeps every message", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-store-"));
+  const store = new InboxStore(dataDir);
+  await store.load();
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  const messages = Array.from({ length: 305 }, (_, index) => ({ id: `m${index}`, role: "assistant", text: `Message ${index}` }));
+  await store.upsertSession("host", { sessionId, generation, status: "idle", messages });
+  const session = store.getSession(`host:${sessionId}`);
+  assert.equal(session.messages.length, messages.length);
+  assert.equal(session.messages[0].id, "m0");
+  assert.equal(session.messages.at(-1).id, "m304");
+  assert.equal(store.publicState().sessions[0].messageCount, messages.length);
 });
 
 test("paired host publishes an inbox item and receives a live reply", async (t) => {
