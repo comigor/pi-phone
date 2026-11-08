@@ -54,6 +54,15 @@ async function bodyBytes(request) {
   return Buffer.concat(chunks);
 }
 
+function sniffMimeType(data, fallback) {
+  if (data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "image/png";
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "image/jpeg";
+  if (data.length >= 6 && ["GIF87a", "GIF89a"].includes(data.subarray(0, 6).toString("ascii"))) return "image/gif";
+  if (data.length >= 12 && data.subarray(0, 4).toString("ascii") === "RIFF" && data.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  if (data.length >= 5 && data.subarray(0, 5).toString("ascii") === "%PDF-") return "application/pdf";
+  return fallback || "application/octet-stream";
+}
+
 function projectFor(session) {
   return {
     id: id("prj", session.cwd || session.key),
@@ -68,7 +77,7 @@ function messageId(session, message, index) {
 
 function attachmentFor(session, message, attachment, index) {
   const data = attachment.data ? Buffer.from(attachment.data, "base64") : Buffer.alloc(0);
-  const mimeType = attachment.mimeType || attachment.mime_type || "application/octet-stream";
+  const mimeType = sniffMimeType(data, attachment.mimeType || attachment.mime_type);
   return {
     id: id("att", session.key, message.id, attachment.name || `image-${index}`, index),
     name: attachment.name || `image-${index + 1}.png`,
@@ -358,9 +367,15 @@ export class VirtualMachines {
     return (session.messageAnnotations || []).filter((record) => !record.sent_reply_id && !record.removed_at);
   }
 
+  persistedAttachments(session) {
+    const messages = [...session.messages, ...(session.remoteReplies || [])];
+    return messages.flatMap((message, index) => this.attachmentsFor(session, messageId(session, message, index)));
+  }
+
   attachmentsModel(session) {
+    const attachments = [...new Map(this.persistedAttachments(session).map((attachment) => [attachment.id, attachment])).values()];
     return {
-      attachments: this.messagesFor(session).flatMap((message) => message.attachments || []),
+      attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })),
       annotations: this.pendingAnnotations(session)
     };
   }
@@ -535,9 +550,9 @@ export class VirtualMachines {
       const bytes = await bodyBytes(request);
       const uploadId = id("upl", randomUUID());
       const name = (url.searchParams.get("name") || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
-      const upload = { upload_id: uploadId, name, data: bytes, mimeType: request.headers["content-type"] || "application/octet-stream" };
+      const upload = { upload_id: uploadId, name, data: bytes, mimeType: sniffMimeType(bytes, request.headers["content-type"]) };
       this.uploads.set(uploadId, upload);
-      return send(response, 200, { upload: { upload_id: uploadId, name, size: bytes.length } });
+      return send(response, 200, { upload: { upload_id: uploadId, name, size: bytes.length, mime_type: upload.mimeType } });
     }
     let match = route.match(new RegExp("^uploads/([^/]+)/text$"));
     if (match && request.method === "GET") {
@@ -603,11 +618,8 @@ export class VirtualMachines {
     match = route.match(new RegExp("^attachments/([^/]+)/(image|download)$"));
     if (match && request.method === "GET") {
       for (const session of this.sessions(machine)) {
-        for (const message of this.messagesFor(session)) {
-          const attachments = this.attachmentsFor(session, message.id);
-          const attachment = attachments.find((item) => item.id === match[1]);
-          if (attachment) return sendBytes(response, 200, attachment.data, attachment.mimeType);
-        }
+        const attachment = this.persistedAttachments(session).find((item) => item.id === match[1]);
+        if (attachment) return sendBytes(response, 200, attachment.data, attachment.mimeType);
       }
       return send(response, 404, { code: "attachment_not_found" });
     }

@@ -143,10 +143,11 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const reply = await replyResponse;
   assert.equal(reply.status, 200);
 
+  const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from("person-image")]);
   const upload = await fetch(`${forwardedBase}/uploads?name=person.png&idempotency_key=upload-contract`, {
     method: "POST",
-    headers: { "content-type": "image/png", origin: central },
-    body: "person-image"
+    headers: { "content-type": "application/octet-stream", origin: central },
+    body: png
   });
   assert.equal(upload.status, 200);
   const uploaded = (await upload.json()).upload;
@@ -158,9 +159,31 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "image-reply-contract", words: "Inspect this image", seen_through_seq: withImage.cursor, uploads: [uploaded.upload_id] })
   });
   const imageReply = await imageReplyDelivery;
-  assert.equal(imageReply.attachments[0].data, Buffer.from("person-image").toString("base64"));
+  assert.equal(imageReply.attachments[0].data, png.toString("base64"));
+  assert.equal(imageReply.attachments[0].mimeType, "image/png");
   agent.send(JSON.stringify({ type: "reply_result", requestId: imageReply.requestId, sessionId, generation, ok: true }));
-  assert.equal((await imageReplyResponse).status, 200);
+  const imageReplyResult = await imageReplyResponse;
+  assert.equal(imageReplyResult.status, 200);
+  const imageReplyBody = await imageReplyResult.json();
+  const uploadedImage = imageReplyBody.reply.attachments[0];
+  assert.equal(uploadedImage.mime_type, "image/png");
+  agent.send(JSON.stringify({
+    type: "session_upsert", sessionId, generation,
+    session: {
+      sessionId, generation, cwd: "/workspace/contract", name: "contract-session", model: "test/model", status: "running",
+      messages: [
+        { id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] },
+        { id: "user-image", role: "user", text: "Inspect this image", images: [] }
+      ]
+    }
+  }));
+  await waitFor(async () => {
+    const model = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
+    return model.thread.messages.some((message) => message.body === "Inspect this image" && message.id !== imageReplyBody.reply.id) ? model : null;
+  });
+  const persistedImage = await fetch(`${forwardedBase}/attachments/${uploadedImage.id}/image`);
+  assert.equal(persistedImage.status, 200);
+  assert.equal(Buffer.from(await persistedImage.arrayBuffer()).toString("base64"), png.toString("base64"));
 
   const annotationResponse = await fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/annotations`, {
     method: "POST",
