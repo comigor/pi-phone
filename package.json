@@ -1,0 +1,30 @@
+{
+  "name": "pi-inbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Central inbox and remote conversation client for live Pi sessions",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": [
+      "./extension/pi-inbox.ts"
+    ]
+  },
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2"
+  }
+}
