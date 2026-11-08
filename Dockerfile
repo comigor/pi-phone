@@ -10,6 +10,8 @@ FROM node:22-bookworm-slim
 ENV NODE_ENV=production
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends socat && rm -rf /var/lib/apt/lists/*
+
 COPY --from=plannotator /usr/local/bin/plannotator /usr/local/bin/plannotator
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund --registry=https://registry.npmjs.org/ && npm cache clean --force
