@@ -252,7 +252,60 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     return JSON.parse(payload);
   };
   assert.deepEqual((await projectArchive(true)).batch.resolved, [listed.thread_id]);
+  const restoreDelivery = nextMessage(agent, "reply");
+  const restoreResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "restore-on-send-contract", words: "Restore this thread", seen_through_seq: opened.cursor })
+  });
+  const restoreRequest = await restoreDelivery;
+  agent.send(JSON.stringify({ type: "reply_result", requestId: restoreRequest.requestId, sessionId, generation, ok: true }));
+  assert.equal((await restoreResponse).status, 200);
+  assert.equal(hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`).resolvedAt, null);
+  assert.deepEqual((await projectArchive(true)).batch.resolved, [listed.thread_id]);
   assert.deepEqual((await projectArchive(false)).threads.map((thread) => thread.thread_id), [listed.thread_id]);
+
+  const pin = async (pinned) => {
+    const response = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads/${listed.thread_id}/pin`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ serverSession: centralHealth.serverSession, pinned })
+    });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const pinned = await pin(true);
+  const pinEntry = pinned.pins.find((thread) => thread.thread_id === listed.thread_id);
+  assert.ok(pinEntry);
+  assert.ok(!(await pin(false)).pins.some((thread) => thread.thread_id === listed.thread_id));
+  const restoredPin = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/pins`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, restore: { thread_id: listed.thread_id, index: 0, pinned_at: pinEntry.pinned_at } })
+  });
+  assert.equal(restoredPin.status, 200);
+  assert.ok((await restoredPin.json()).pins.some((thread) => thread.thread_id === listed.thread_id));
+  assert.ok(!(await pin(false)).pins.some((thread) => thread.thread_id === listed.thread_id));
+
+  const until = new Date(Date.now() + 60 * 60_000).toISOString();
+  const snooze = async (value) => {
+    const response = await fetch(`${forwardedBase}/threads/${listed.thread_id}/snooze`, {
+      method: "POST", headers: { "content-type": "application/json", origin: central },
+      body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: randomUUID(), until: value })
+    });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  assert.equal((await snooze(until)).snoozed.until, until);
+  const snoozedList = await waitFor(async () => {
+    const model = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads?archived=exclude&snoozed=exclude&machines=1`)).json();
+    return model.snoozed?.some((thread) => thread.thread_id === listed.thread_id) ? model : null;
+  });
+  assert.ok(snoozedList.sections.flatMap((section) => section.threads).every((thread) => thread.thread_id !== listed.thread_id));
+  assert.equal((await snooze(null)).snoozed, null);
+  const expired = new Date(Date.now() - 60_000).toISOString();
+  await snooze(expired);
+  const expiredList = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads?archived=exclude&snoozed=exclude&machines=1`)).json();
+  assert.ok(expiredList.snoozed.every((thread) => thread.thread_id !== listed.thread_id));
+  assert.ok(expiredList.sections.flatMap((section) => section.threads).some((thread) => thread.thread_id === listed.thread_id));
+  await snooze(null);
   const draft = await fetch(`${forwardedBase}/threads/${listed.thread_id}/draft`);
   assert.equal(draft.status, 200);
   assert.equal((await draft.json()).draft, null);
@@ -326,6 +379,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     { id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] },
     { id: "user-continue", role: "user", text: "Continue remotely", images: [] },
     { id: "user-image", role: "user", text: "Inspect this image\n\n[Image: original 1x1, displayed at 1x1.]", images: [{ data: Buffer.from("transcoded-jpeg").toString("base64"), mimeType: "image/jpeg" }] },
+    { id: "user-restore", role: "user", text: "Restore this thread", images: [] },
     { id: "assistant-2", role: "assistant", text: "Image answer", images: [] }
   ];
   const publishPersisted = (status) => agent.send(JSON.stringify({

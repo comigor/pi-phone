@@ -252,6 +252,10 @@ export class VirtualMachines {
     return [...this.machines.values()].map((machine) => this.search(machine, url, false));
   }
 
+  listAll() {
+    return [...this.machines.values()].map((machine) => ({ machine: machine.inboxId, model: this.list(machine) }));
+  }
+
   session(machine, threadId) {
     return this.sessions(machine).find((session) => id("msg", session.key) === threadId);
   }
@@ -428,9 +432,40 @@ export class VirtualMachines {
     return [...this.machines.values()].map((machine) => this.archived(machine, url, false));
   }
 
+  pinnedSessions(hostId) {
+    return this.store.state.sessions.filter((session) => session.pinnedAt && (!hostId || session.hostId === hostId)).sort((left, right) =>
+      (left.pinOrder ?? Number.MAX_SAFE_INTEGER) - (right.pinOrder ?? Number.MAX_SAFE_INTEGER) || left.pinnedAt.localeCompare(right.pinnedAt)
+    );
+  }
+
+  pinEntries(hostId) {
+    return this.pinnedSessions(hostId).map((session) => ({ thread_id: id("msg", session.key), pinned_at: session.pinnedAt }));
+  }
+
+  async setPin(session, pinned, restore) {
+    await this.store.updateVirtualSession(session.key, {
+      pinnedAt: pinned ? restore?.pinned_at || session.pinnedAt || new Date().toISOString() : null,
+      pinOrder: pinned ? restore?.index ?? session.pinOrder ?? null : null
+    });
+    await this.changed(session, { thread_id: id("msg", session.key) }, "pins");
+  }
+
+  async orderPins(order) {
+    const position = new Map(order.map((threadId, index) => [threadId, index]));
+    for (const session of this.pinnedSessions()) {
+      const threadId = id("msg", session.key);
+      const pinOrder = position.has(threadId) ? position.get(threadId) : order.length + (session.pinOrder ?? 0);
+      if (session.pinOrder === pinOrder) continue;
+      await this.store.updateVirtualSession(session.key, { pinOrder });
+      await this.changed(session, { thread_id: threadId }, "pins");
+    }
+  }
+
   list(machine) {
     const all = this.sessions(machine);
-    const rows = all.filter((session) => !session.resolvedAt).map((session) => this.row(session));
+    const visible = all.filter((session) => !session.resolvedAt);
+    const snoozed = visible.filter((session) => Date.parse(session.snoozedUntil) > Date.now()).sort((left, right) => left.snoozedUntil.localeCompare(right.snoozedUntil));
+    const rows = visible.filter((session) => !(Date.parse(session.snoozedUntil) > Date.now())).map((session) => this.row(session));
     const projects = this.projectRows(all);
     const section = (sectionId, label) => ({ id: sectionId, label, threads: rows.filter((row) => row.section === sectionId) });
     return {
@@ -447,8 +482,9 @@ export class VirtualMachines {
         section("sent", "Sent"),
         section("quiet", "Quiet")
       ],
-      snoozes: false,
-      pins: []
+      snoozes: true,
+      snoozed: snoozed.map((session) => this.row(session)),
+      pins: this.pinnedSessions(machine.hostId).map((session) => ({ ...this.row(session), machine: machine.inboxId, pinned_at: session.pinnedAt }))
     };
   }
 
@@ -600,7 +636,7 @@ export class VirtualMachines {
     return send(response, 200, { message });
   }
 
-  changed(session, record) {
+  changed(session, record, event = "record") {
     this.threadCache.delete(session.key);
     const machine = this.machines.get(session.hostId);
     if (!machine) return Promise.resolve();
@@ -608,12 +644,13 @@ export class VirtualMachines {
     if (existing) {
       existing.session = session;
       existing.record = record;
+      existing.event = event;
       return existing.promise;
     }
     let resolve;
     let reject;
     const promise = new Promise((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
-    const batch = { session, record, promise, resolve, reject, timer: undefined };
+    const batch = { session, record, event, promise, resolve, reject, timer: undefined };
     batch.timer = setTimeout(() => this.flushChange(session.hostId), 25);
     this.changeBatches.set(session.hostId, batch);
     return promise;
@@ -631,7 +668,7 @@ export class VirtualMachines {
       await this.persist();
       const data = JSON.stringify(batch.record || { message: this.lastMessage(batch.session) });
       for (const stream of this.streams.get(hostId) || []) {
-        if (!stream.destroyed && !stream.writableEnded) stream.write(`id: ${machine.cursor}\nevent: record\ndata: ${data}\n\n`);
+        if (!stream.destroyed && !stream.writableEnded) stream.write(`id: ${machine.cursor}\nevent: ${batch.event}\ndata: ${data}\n\n`);
       }
       batch.resolve();
     } catch (error) {
@@ -678,6 +715,7 @@ export class VirtualMachines {
     const previous = (session.remoteReplies || []).find((message) => message.requestId === key);
     if (previous) return send(response, 200, { reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
     await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });
+    if (session.resolvedAt) await this.store.updateVirtualSession(session.key, { resolvedAt: null, backFromArchive: false });
     const appended = await this.store.appendRemoteReply(session.key, { requestId: key, text, attachments });
     if (typeof body.clear_draft === "string") await this.drafts.clearSent(id("msg", session.key), body.clear_draft, combined, Array.isArray(body.uploads) ? body.uploads : []);
     const reply = this.virtualMessage(session, appended.message, session.messages.length);
@@ -778,6 +816,15 @@ export class VirtualMachines {
     if (match && request.method === "POST") {
       const session = this.session(machine, match[1]);
       if (!session) return send(response, 404, { code: "thread_not_found" });
+      if (match[2] === "snooze") {
+        const body = await bodyJson(request);
+        const until = body.until === null ? null : body.until;
+        if (until !== null && (typeof until !== "string" || !Number.isFinite(Date.parse(until)))) return send(response, 422, { code: "validation_error", error: "until must be an ISO time or null" });
+        const at = typeof body.at === "string" ? body.at : new Date().toISOString();
+        await this.store.updateVirtualSession(session.key, { snoozedUntil: until, snoozedAt: at });
+        await this.changed(session, { thread_id: id("msg", session.key) }, "snoozes");
+        return send(response, 200, { snoozed: until ? { until, at } : null });
+      }
       const read = match[2] === "seen" || match[2] === "read";
       await this.store.updateVirtualSession(session.key, { readAt: read ? new Date().toISOString() : null });
       await this.changed(session);

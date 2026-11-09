@@ -399,6 +399,85 @@ export class InboxHub {
     }
   }
 
+  async handleVirtualThreadList(request, response, url) {
+    if (url.pathname !== "/api/inbox/threads" || request.method !== "GET" || !this.plannotator?.url) return false;
+    const upstream = await fetch(new URL(url.pathname + url.search, this.plannotator.url), {
+      headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000)
+    });
+    if (!upstream.ok) {
+      sendJson(response, upstream.status, await upstream.json());
+      return true;
+    }
+    const model = await upstream.json();
+    const project = url.searchParams.get("project");
+    const remoteModels = this.virtual.listAll();
+    const remoteSnoozed = remoteModels.flatMap(({ machine, model: remote }) =>
+      (remote.snoozed || []).filter((thread) => !project || thread.project_id === project).map((thread) => ({ ...thread, machine }))
+    );
+    const remotePins = remoteModels.flatMap(({ machine, model: remote }) => (remote.pins || []).map((thread) => ({ ...thread, machine })));
+    for (const section of model.sections || []) {
+      section.threads = (section.threads || []).filter((thread) => !this.virtual.findThread(thread.thread_id));
+      for (const { machine, model: remote } of remoteModels) {
+        const threads = remote.sections.find((candidate) => candidate.id === section.id)?.threads || [];
+        section.threads.push(...threads.filter((thread) => !project || thread.project_id === project).map((thread) => ({ ...thread, machine })));
+      }
+    }
+    model.snoozed = [...(model.snoozed || []).filter((thread) => !this.virtual.findThread(thread.thread_id)), ...remoteSnoozed];
+    model.pins = [...(model.pins || []).filter((thread) => !this.virtual.findThread(thread.thread_id)), ...remotePins];
+    sendJson(response, 200, model);
+    return true;
+  }
+
+  async mergedPinEntries() {
+    const upstream = await fetch(new URL("/api/inbox/threads?archived=exclude&snoozed=exclude&machines=1", this.plannotator.url), {
+      headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000)
+    });
+    if (!upstream.ok) throw new Error("Could not read central pins");
+    const model = await upstream.json();
+    const local = (model.pins || []).filter((thread) => !this.virtual.findThread(thread.thread_id)).map((thread) => ({
+      thread_id: thread.thread_id,
+      pinned_at: thread.pinned_at || new Date().toISOString()
+    }));
+    return [...local, ...this.virtual.pinEntries()];
+  }
+
+  async handleVirtualPins(request, response, url) {
+    if (request.method !== "POST" || !this.plannotator?.url) return false;
+    const match = url.pathname.match(/^\/api\/inbox\/threads\/([^/]+)\/pin$/);
+    if (match) {
+      const session = this.virtual.findThread(match[1]);
+      if (!session) return false;
+      const body = await readJson(request) || {};
+      await this.virtual.setPin(session, body.pinned === true);
+      sendJson(response, 200, { pins: await this.mergedPinEntries() });
+      return true;
+    }
+    if (url.pathname !== "/api/inbox/pins") return false;
+    const body = await readJson(request) || {};
+    const restoreSession = typeof body.restore?.thread_id === "string" ? this.virtual.findThread(body.restore.thread_id) : null;
+    const order = Array.isArray(body.order) ? body.order : null;
+    const hasVirtualOrder = order?.some((threadId) => this.virtual.findThread(threadId));
+    if (!restoreSession && !hasVirtualOrder) return false;
+    if (restoreSession) {
+      await this.virtual.setPin(restoreSession, true, body.restore);
+    } else {
+      await this.virtual.orderPins(order);
+      const localOrder = order.filter((threadId) => !this.virtual.findThread(threadId));
+      if (localOrder.length) {
+        const upstream = await fetch(new URL("/api/inbox/pins", this.plannotator.url), {
+          method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ ...body, order: localOrder }), signal: AbortSignal.timeout(10_000)
+        });
+        if (!upstream.ok) {
+          sendJson(response, upstream.status, await upstream.json());
+          return true;
+        }
+      }
+    }
+    sendJson(response, 200, { pins: await this.mergedPinEntries() });
+    return true;
+  }
+
   async handleVirtualSearch(request, response, url) {
     if (url.pathname !== "/api/inbox/search" || request.method !== "GET" || !this.plannotator?.url) return false;
     const target = new URL(url.pathname + url.search, this.plannotator.url);
@@ -522,6 +601,8 @@ export class InboxHub {
       if (url.pathname === "/api/inbox/tidy" && request.method === "GET" && this.virtual.hasProject(url.searchParams.get("project"))) {
         return sendJson(response, 200, { serverSession: this.plannotator?.serverSession, count: 0, agents: [], run: null });
       }
+      if (await this.handleVirtualThreadList(request, response, url)) return;
+      if (await this.handleVirtualPins(request, response, url)) return;
       if (await this.handleVirtualSearch(request, response, url)) return;
       if (await this.handleVirtualArchived(request, response, url)) return;
       if (await this.handleVirtualDraft(request, response, url)) return;
