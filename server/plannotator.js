@@ -84,7 +84,7 @@ export class PlannotatorRuntime {
     if (headers.referer) headers.referer = this.url.origin;
     const upstream = (target.protocol === "https:" ? httpsRequest : httpRequest)(target, { method: request.method, headers }, (upstreamResponse) => {
       const contentType = String(upstreamResponse.headers["content-type"] || "");
-      const compressible = /^(application\/(json|javascript)|text\/(?!event-stream)|image\/svg\+xml)/.test(contentType);
+      const compressible = contentType.startsWith("application/json");
       if (acceptsGzip && compressible && !upstreamResponse.headers["content-encoding"] && !upstreamResponse.headers.range) {
         const responseHeaders = { ...upstreamResponse.headers, "content-encoding": "gzip", vary: [upstreamResponse.headers.vary, "Accept-Encoding"].filter(Boolean).join(", ") };
         delete responseHeaders["content-length"];
