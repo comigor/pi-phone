@@ -31,7 +31,10 @@ export class InboxStore {
       if (error.code !== "ENOENT") throw error;
     }
     for (const host of this.state.hosts) host.online = false;
-    for (const session of this.state.sessions) session.online = false;
+    for (const session of this.state.sessions) {
+      session.online = false;
+      for (const message of session.messages) message.createdAt ??= session.createdAt || session.updatedAt;
+    }
     this.state.subscriptions = this.state.subscriptions.filter((item) => item && typeof item.endpoint === "string");
   }
 
@@ -135,7 +138,9 @@ export class InboxStore {
       session = { key, hostId, sessionId: incoming.sessionId, generation: incoming.generation, messages: [], remoteReplies: [], virtualCursor: 0 };
       this.state.sessions.push(session);
     }
-    const nextMessages = cleanMessages(incoming.messages);
+    const previousMessages = new Map(session.messages.map((message) => [message.id, message]));
+    const arrivedAt = new Date().toISOString();
+    const nextMessages = cleanMessages(incoming.messages).map((message) => ({ ...message, createdAt: message.createdAt || previousMessages.get(message.id)?.createdAt || arrivedAt }));
     const changed = session.status !== (incoming.status || "idle") || JSON.stringify(session.messages) !== JSON.stringify(nextMessages);
     Object.assign(session, {
       generation: incoming.generation,
@@ -161,6 +166,7 @@ export class InboxStore {
     let changed = session.status !== (incoming.status || "idle");
     for (const next of cleanMessages(incoming.messages)) {
       const index = session.messages.findIndex((message) => message.id === next.id);
+      next.createdAt ??= session.messages[index]?.createdAt || new Date().toISOString();
       if (index < 0) {
         session.messages.push(next);
         changed = true;

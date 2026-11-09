@@ -92,7 +92,47 @@ test("full-history updates project only the latest message", async (t) => {
   virtual.virtualMessage = function (...args) { projections++; return project.apply(this, args); };
   await virtual.changed(session);
   virtual.row(session);
+  assert.equal(projections, 1);
+});
+
+test("history refreshes only project new or changed messages", () => {
+  const virtual = new VirtualMachines({ dataDir: "/tmp" });
+  const session = {
+    key: "host:session", hostId: "host", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z",
+    messages: [{ id: "one", role: "assistant", text: "one" }, { id: "two", role: "assistant", text: "two" }], remoteReplies: []
+  };
+  let projections = 0;
+  const project = virtual.virtualMessage;
+  virtual.virtualMessage = function (...args) { projections++; return project.apply(this, args); };
+  const first = virtual.messagesFor(session);
   assert.equal(projections, 2);
+  assert.deepEqual(virtual.messagesFor(session), first);
+  assert.equal(projections, 2);
+  session.messages.push({ id: "three", role: "assistant", text: "three" });
+  virtual.messagesFor(session);
+  assert.equal(projections, 3);
+  session.messages[0] = { ...session.messages[0], text: "changed" };
+  virtual.messagesFor(session);
+  assert.equal(projections, 4);
+  session.acks = { [first[0].id]: { emoji: "👍" } };
+  virtual.messagesFor(session);
+  assert.equal(projections, 5);
+});
+
+test("virtual change bursts emit one latest-message notification", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-changes-"));
+  const virtual = new VirtualMachines({ dataDir });
+  virtual.machines.set("host", { cursor: 0 });
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const session = { key: "host:session", hostId: "host", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z", messages: [{ id: "one", role: "assistant", text: "one" }], remoteReplies: [] };
+  const writes = [];
+  virtual.streams.set("host", new Set([{ write: (value) => writes.push(value) }]));
+  const first = virtual.changed(session);
+  session.messages.push({ id: "two", role: "assistant", text: "two" });
+  await Promise.all([first, virtual.changed(session), virtual.changed(session)]);
+  assert.equal(virtual.machines.get("host").cursor, 1);
+  assert.equal(writes.length, 1);
+  assert.ok(writes[0].includes("two"));
 });
 
 test("attachment listing makes one pass over session history", () => {

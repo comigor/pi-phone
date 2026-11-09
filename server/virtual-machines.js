@@ -127,6 +127,8 @@ export class VirtualMachines {
     this.linkRetries = new Map();
     this.uploads = new Map();
     this.threadCache = new Map();
+    this.messageCache = new WeakMap();
+    this.changeBatches = new Map();
     this.writeQueue = Promise.resolve();
   }
 
@@ -250,6 +252,16 @@ export class VirtualMachines {
     };
   }
 
+  cachedVirtualMessage(session, message, index) {
+    const mid = messageId(session, message, index);
+    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null]);
+    const cached = this.messageCache.get(message);
+    if (cached?.key === key) return cached.value;
+    const value = this.virtualMessage(session, message, index);
+    this.messageCache.set(message, { key, value });
+    return value;
+  }
+
   controlMessage(session) {
     const running = session.status === "running" || session.status === "waiting";
     return {
@@ -282,7 +294,7 @@ export class VirtualMachines {
 
   messagesFor(session) {
     const messages = this.sourceMessagesFor(session);
-    const result = messages.map((message, index) => this.virtualMessage(session, message, index));
+    const result = messages.map((message, index) => this.cachedVirtualMessage(session, message, index));
     if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) result.push(this.controlMessage(session));
     return result;
   }
@@ -290,7 +302,7 @@ export class VirtualMachines {
   lastMessage(session, messages = this.sourceMessagesFor(session)) {
     if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) return this.controlMessage(session);
     const last = messages.at(-1);
-    return last ? this.virtualMessage(session, last, messages.length - 1) : this.controlMessage(session);
+    return last ? this.cachedVirtualMessage(session, last, messages.length - 1) : this.controlMessage(session);
   }
 
   row(session) {
@@ -524,19 +536,51 @@ export class VirtualMachines {
     return send(response, 200, { message });
   }
 
-  async changed(session, record) {
+  changed(session, record) {
     this.threadCache.delete(session.key);
     const machine = this.machines.get(session.hostId);
-    if (!machine) return;
-    machine.cursor = (machine.cursor || 0) + 1;
-    await this.persist();
-    const data = JSON.stringify(record || { message: this.lastMessage(session) });
-    for (const stream of this.streams.get(machine.hostId) || []) {
-      stream.write(`id: ${machine.cursor}\nevent: record\ndata: ${data}\n\n`);
+    if (!machine) return Promise.resolve();
+    const existing = this.changeBatches.get(session.hostId);
+    if (existing) {
+      existing.session = session;
+      existing.record = record;
+      return existing.promise;
+    }
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+    const batch = { session, record, promise, resolve, reject, timer: undefined };
+    batch.timer = setTimeout(() => this.flushChange(session.hostId), 25);
+    this.changeBatches.set(session.hostId, batch);
+    return promise;
+  }
+
+  async flushChange(hostId) {
+    const batch = this.changeBatches.get(hostId);
+    if (!batch) return;
+    clearTimeout(batch.timer);
+    this.changeBatches.delete(hostId);
+    const machine = this.machines.get(hostId);
+    if (!machine) return batch.resolve();
+    try {
+      machine.cursor = (machine.cursor || 0) + 1;
+      await this.persist();
+      const data = JSON.stringify(batch.record || { message: this.lastMessage(batch.session) });
+      for (const stream of this.streams.get(hostId) || []) {
+        if (!stream.destroyed && !stream.writableEnded) stream.write(`id: ${machine.cursor}\nevent: record\ndata: ${data}\n\n`);
+      }
+      batch.resolve();
+    } catch (error) {
+      batch.reject(error);
     }
   }
 
+  async flushChanges() {
+    await Promise.all([...this.changeBatches.keys()].map((hostId) => this.flushChange(hostId)));
+  }
+
   async hostOffline(hostId) {
+    await this.flushChange(hostId);
     for (const stream of this.streams.get(hostId) || []) stream.end();
     this.streams.delete(hostId);
   }

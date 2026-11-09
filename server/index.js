@@ -118,6 +118,7 @@ export class InboxHub {
     for (const retry of this.virtual.linkRetries.values()) clearTimeout(retry);
     for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
     await Promise.all(serverClosures);
+    await this.virtual.flushChanges();
     await Promise.all([this.store.flush(), this.virtual.writeQueue]);
   }
 
