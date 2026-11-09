@@ -158,6 +158,10 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(opened.thread.messages[0].body, "Remote assistant");
   assert.ok(opened.thread.messages.some((message) => message.body.includes("Stop agent")));
 
+  const publicThread = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/m/${machine.id}/threads/${listed.thread_id}`, { headers: { "accept-encoding": "gzip" } });
+  assert.equal(publicThread.headers.get("content-encoding"), "gzip");
+  assert.equal((await publicThread.json()).thread.messages[0].body, "Remote assistant");
+
   const image = opened.thread.messages[0].attachments[0];
   const imageResponse = await fetch(`${forwardedBase}/attachments/${image.id}/image`);
   assert.equal(imageResponse.status, 200);

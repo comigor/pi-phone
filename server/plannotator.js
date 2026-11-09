@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { promisify } from "node:util";
+import { createGzip } from "node:zlib";
 
 const exec = promisify(execFile);
 
@@ -64,7 +65,8 @@ export class PlannotatorRuntime {
       return;
     }
     const target = new URL(request.url, this.url);
-    const headers = { ...request.headers, host: target.host };
+    const headers = { ...request.headers, host: target.host, "accept-encoding": "identity" };
+    const acceptsGzip = /\bgzip\b/.test(String(request.headers["accept-encoding"] || ""));
     for (const name of [
       "forwarded",
       "x-forwarded-for",
@@ -81,6 +83,16 @@ export class PlannotatorRuntime {
     if (headers.origin) headers.origin = this.url.origin;
     if (headers.referer) headers.referer = this.url.origin;
     const upstream = (target.protocol === "https:" ? httpsRequest : httpRequest)(target, { method: request.method, headers }, (upstreamResponse) => {
+      const contentType = String(upstreamResponse.headers["content-type"] || "");
+      const compressible = /^(application\/(json|javascript)|text\/(?!event-stream)|image\/svg\+xml)/.test(contentType);
+      if (acceptsGzip && compressible && !upstreamResponse.headers["content-encoding"] && !upstreamResponse.headers.range) {
+        const responseHeaders = { ...upstreamResponse.headers, "content-encoding": "gzip", vary: [upstreamResponse.headers.vary, "Accept-Encoding"].filter(Boolean).join(", ") };
+        delete responseHeaders["content-length"];
+        delete responseHeaders.etag;
+        response.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
+        upstreamResponse.pipe(createGzip()).pipe(response);
+        return;
+      }
       response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
       upstreamResponse.pipe(response);
     });
