@@ -86,6 +86,11 @@ test("session history keeps every message", async (t) => {
   assert.equal(session.messages[0].id, "m0");
   assert.equal(session.messages.at(-1).id, "m304");
   assert.equal(store.publicState().sessions[0].messageCount, messages.length);
+  await store.patchSession("host", { sessionId, generation, status: "running", messages: [{ id: "m305", role: "assistant", text: "Message 305" }] });
+  assert.equal(session.messages.length, 306);
+  assert.equal(session.messages[0].id, "m0");
+  assert.equal(session.messages.at(-1).id, "m305");
+  assert.equal(session.status, "running");
 });
 
 test("paired host publishes an inbox item and receives a live reply", async (t) => {

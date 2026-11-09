@@ -49,8 +49,9 @@ function imageContent(content: unknown) {
   }));
 }
 
-function buildSnapshot(ctx: ExtensionContext, generation: string, status: string) {
-  const messages = ctx.sessionManager.getBranch().flatMap((entry) => {
+function buildSnapshot(ctx: ExtensionContext, generation: string, status: string, latestOnly = false) {
+  const branch = ctx.sessionManager.getBranch();
+  const messages = (latestOnly ? branch.slice(-1) : branch).flatMap((entry) => {
     if (entry.type !== "message") return [];
     const message = entry.message;
     if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return [];
@@ -194,7 +195,11 @@ class PiInboxRuntime {
       this.canSend = true;
       this.pairingCode = undefined;
       this.setStatus(undefined);
-      this.snapshot(this.latestSnapshot.status);
+      this.snapshot(this.latestSnapshot.status, true);
+      return;
+    }
+    if (message.type === "session_snapshot_required") {
+      this.snapshot(this.latestSnapshot.status, true);
       return;
     }
     if (message.type === "stop") {
@@ -253,9 +258,9 @@ class PiInboxRuntime {
     this.socket.send(JSON.stringify(message));
   }
 
-  snapshot(status: string) {
-    this.latestSnapshot = buildSnapshot(this.ctx, this.generation, status);
-    this.send({ type: "session_upsert", sessionId: this.latestSnapshot.sessionId, generation: this.generation, session: this.latestSnapshot });
+  snapshot(status: string, full = false) {
+    this.latestSnapshot = buildSnapshot(this.ctx, this.generation, status, !full);
+    this.send({ type: full ? "session_upsert" : "session_patch", sessionId: this.latestSnapshot.sessionId, generation: this.generation, session: this.latestSnapshot });
   }
 
   event(event: Record<string, unknown>) {
@@ -320,8 +325,8 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("tool_execution_start", async (event) => runtime?.event({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId }));
   pi.on("tool_execution_end", async (event) => runtime?.event({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError }));
-  pi.on("model_select", async () => runtime?.snapshot("idle"));
-  pi.on("session_info_changed", async () => runtime?.snapshot("idle"));
+  pi.on("model_select", async () => runtime?.snapshot("idle", true));
+  pi.on("session_info_changed", async () => runtime?.snapshot("idle", true));
   pi.on("ui_prompt_start", async (event) => runtime?.promptStarted(event.kind, event.title));
   pi.on("ui_prompt_end", async () => runtime?.promptEnded());
 }

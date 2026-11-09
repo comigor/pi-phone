@@ -135,6 +135,36 @@ export class InboxStore {
     return session;
   }
 
+  async patchSession(hostId, incoming) {
+    const key = sessionKey(hostId, incoming.sessionId);
+    const session = this.getSession(key);
+    if (!session) return undefined;
+    let changed = session.status !== (incoming.status || "idle");
+    for (const next of cleanMessages(incoming.messages)) {
+      const index = session.messages.findIndex((message) => message.id === next.id);
+      if (index < 0) {
+        session.messages.push(next);
+        changed = true;
+      } else if (JSON.stringify(session.messages[index]) !== JSON.stringify(next)) {
+        session.messages[index] = next;
+        changed = true;
+      }
+    }
+    Object.assign(session, {
+      generation: incoming.generation,
+      cwd: excerpt(incoming.cwd, 2048),
+      name: excerpt(incoming.name, 200),
+      model: excerpt(incoming.model, 200),
+      thinkingLevel: excerpt(incoming.thinkingLevel, 40),
+      status: excerpt(incoming.status, 40) || "idle",
+      online: true,
+      updatedAt: new Date().toISOString()
+    });
+    session.virtualCursor = (session.virtualCursor ?? 0) + (changed ? 1 : 0);
+    await this.persist();
+    return session;
+  }
+
   getSession(key) {
     return this.state.sessions.find((item) => item.key === key);
   }
