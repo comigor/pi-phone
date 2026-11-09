@@ -199,6 +199,16 @@ function handleMessage(message) {
     if (state.selectedKey && (!previous || !state.selectedSession || previous.online !== state.selectedSession.online || previous.status !== state.selectedSession.status)) renderMain();
     return;
   }
+  if (message.type === "session_patch" && message.session) {
+    const previous = state.sessions.find((item) => item.key === message.session.key);
+    const messages = [...(previous?.messages || [])];
+    for (const incoming of message.session.messages || []) {
+      const index = messages.findIndex((item) => item.id === incoming.id);
+      if (index >= 0) messages[index] = incoming;
+      else messages.push(incoming);
+    }
+    message = { ...message, type: "session", session: { ...previous, ...message.session, messages } };
+  }
   if (message.type === "session" && message.session) {
     const index = state.sessions.findIndex((item) => item.key === message.session.key);
     if (index >= 0) state.sessions[index] = { ...state.sessions[index], ...message.session };

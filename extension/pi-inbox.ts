@@ -325,8 +325,8 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("tool_execution_start", async (event) => runtime?.event({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId }));
   pi.on("tool_execution_end", async (event) => runtime?.event({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError }));
-  pi.on("model_select", async () => runtime?.snapshot("idle", true));
-  pi.on("session_info_changed", async () => runtime?.snapshot("idle", true));
+  pi.on("model_select", async () => runtime?.snapshot("idle"));
+  pi.on("session_info_changed", async () => runtime?.snapshot("idle"));
   pi.on("ui_prompt_start", async (event) => runtime?.promptStarted(event.kind, event.title));
   pi.on("ui_prompt_end", async () => runtime?.promptEnded());
 }

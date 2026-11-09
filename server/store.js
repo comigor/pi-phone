@@ -37,10 +37,14 @@ export class InboxStore {
   async persist() {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       const temporary = `${this.stateFile}.${process.pid}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+      await writeFile(temporary, `${JSON.stringify(this.state)}\n`, { mode: 0o600 });
       await rename(temporary, this.stateFile);
     });
     return this.writeQueue;
+  }
+
+  async flush() {
+    await this.writeQueue;
   }
 
   async challengeHost({ hostId, publicKey, name }) {

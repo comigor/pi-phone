@@ -112,7 +112,7 @@ export class InboxHub {
     for (const socket of [...agents, ...this.viewers]) socket.terminate();
     await Promise.all(agents.map((socket) => this.agentClosures.get(socket)));
     for (const retry of this.virtual.linkRetries.values()) clearTimeout(retry);
-    await Promise.all([this.store.writeQueue, this.virtual.writeQueue]);
+    await Promise.all([this.store.flush(), this.virtual.writeQueue]);
     for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
     await Promise.all([this.agentHttp, this.viewerHttp, this.doorHttp].filter((server) => server.listening).map((server) => new Promise((resolve) => server.close(resolve))));
   }
@@ -228,7 +228,7 @@ export class InboxHub {
         await this.store.resolveSessionInbox(key);
         this.broadcastState();
       }
-      this.broadcast({ type: "session", session });
+      this.broadcast({ type: message.type === "session_patch" ? "session_patch" : "session", session });
       await this.virtual.changed(session);
       return;
     }
