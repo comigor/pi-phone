@@ -95,6 +95,20 @@ test("full-history updates project only the latest message", async (t) => {
   assert.equal(projections, 2);
 });
 
+test("attachment listing makes one pass over session history", () => {
+  const virtual = new VirtualMachines({ dataDir: "/tmp" });
+  const session = {
+    key: "host:session", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z",
+    messages: Array.from({ length: 1705 }, (_, index) => ({ id: `m${index}`, role: "assistant", text: `Message ${index}`, images: index === 1704 ? [{ data: "aW1hZ2U=", mimeType: "image/png" }] : [] })), remoteReplies: []
+  };
+  let legacyScans = 0;
+  virtual.attachmentsFor = () => { legacyScans++; return []; };
+  const attachments = virtual.persistedAttachments(session);
+  assert.equal(legacyScans, 0);
+  assert.equal(attachments.length, 1);
+  assert.equal(attachments[0].data.toString(), "image");
+});
+
 test("an unchanged Plannotator links to a virtual Pi host and controls its session", { skip: !available, timeout: 60_000 }, async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-virtual-"));
   const agentIdentity = identity();

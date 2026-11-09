@@ -4,12 +4,19 @@ import path from "node:path";
 
 const ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
+const ID_CACHE = new Map();
 
 function id(prefix, ...parts) {
+  const key = `${prefix}\0${parts.join("\0")}`;
+  const cached = ID_CACHE.get(key);
+  if (cached) return cached;
   const digest = createHash("sha256").update(parts.join("\0")).digest();
   let value = "";
   for (let index = 0; index < 26; index++) value += ID_ALPHABET[digest[index] & 31];
-  return `${prefix}_${value}`;
+  const result = `${prefix}_${value}`;
+  if (ID_CACHE.size >= 50_000) ID_CACHE.clear();
+  ID_CACHE.set(key, result);
+  return result;
 }
 
 function send(response, status, body, headers = {}) {
@@ -425,7 +432,7 @@ export class VirtualMachines {
 
   persistedAttachments(session) {
     const messages = [...session.messages, ...(session.remoteReplies || [])];
-    return messages.flatMap((message, index) => this.attachmentsFor(session, messageId(session, message, index)));
+    return messages.flatMap((message) => (message.attachments || message.images || []).map((item, index) => attachmentFor(session, message, item, index)));
   }
 
   attachmentsModel(session) {
@@ -549,10 +556,6 @@ export class VirtualMachines {
     });
   }
 
-  attachmentsFor(session, messageIdValue) {
-    const original = [...session.messages, ...(session.remoteReplies || [])].find((item, index) => messageId(session, item, index) === messageIdValue);
-    return (original?.attachments || original?.images || []).map((item, index) => attachmentFor(session, original, item, index));
-  }
 
   async reply(_machine, session, body, _request, response, compose = false) {
     const key = requireKey(body.idempotency_key);
