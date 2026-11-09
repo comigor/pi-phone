@@ -17,6 +17,11 @@ function send(response, status, body, headers = {}) {
   response.end(JSON.stringify(body));
 }
 
+function sendSerialized(response, status, body) {
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  response.end(body);
+}
+
 function sendBytes(response, status, bytes, contentType) {
   response.writeHead(status, {
     "content-type": contentType,
@@ -114,6 +119,7 @@ export class VirtualMachines {
     this.streams = new Map();
     this.linkRetries = new Map();
     this.uploads = new Map();
+    this.threadCache = new Map();
     this.writeQueue = Promise.resolve();
   }
 
@@ -512,6 +518,7 @@ export class VirtualMachines {
   }
 
   async changed(session, record) {
+    this.threadCache.delete(session.key);
     const machine = this.machines.get(session.hostId);
     if (!machine) return;
     machine.cursor = (machine.cursor || 0) + 1;
@@ -627,7 +634,13 @@ export class VirtualMachines {
     match = route.match(new RegExp("^threads/([^/]+)$"));
     if (match && request.method === "GET") {
       const session = this.session(machine, match[1]);
-      return session ? send(response, 200, this.thread(session)) : send(response, 404, { code: "thread_not_found" });
+      if (!session) return send(response, 404, { code: "thread_not_found" });
+      let body = this.threadCache.get(session.key);
+      if (!body) {
+        body = JSON.stringify(this.thread(session));
+        this.threadCache.set(session.key, body);
+      }
+      return sendSerialized(response, 200, body);
     }
     match = route.match(new RegExp("^threads/([^/]+)/sessions$"));
     if (match && request.method === "GET") {
