@@ -239,6 +239,7 @@ export class InboxHub {
     if (message.type === "session_upsert" || message.type === "session_patch") {
       requireString(message.session?.generation, "generation", 100);
       if (message.session.generation !== generation || message.session.sessionId !== sessionId) throw new Error("Session identity mismatch");
+      if (message.type === "session_upsert" && !this.store.getSession(key) && !message.session.messages?.length) return;
       const session = message.type === "session_patch" ? await this.store.patchSession(host.id, message.session) : await this.store.upsertSession(host.id, message.session);
       if (!session) return socketSend(socket, { type: "session_snapshot_required", sessionId, generation });
       await this.virtual.ensureLinked(host);

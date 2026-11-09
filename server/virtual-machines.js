@@ -20,6 +20,9 @@ function id(prefix, ...parts) {
   return result;
 }
 
+function hasThreadContent(session) {
+  return Boolean(session.messages?.length || session.remoteReplies?.length);
+}
 function send(response, status, body, headers = {}) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers });
   response.end(JSON.stringify(body));
@@ -245,11 +248,11 @@ export class VirtualMachines {
   }
 
   sessions(machine) {
-    return this.store.state.sessions.filter((session) => session.hostId === machine.hostId);
+    return this.store.state.sessions.filter((session) => session.hostId === machine.hostId && hasThreadContent(session));
   }
 
   hasProject(projectId) {
-    return this.store.state.sessions.some((session) => projectFor(session).id === projectId);
+    return this.store.state.sessions.some((session) => hasThreadContent(session) && projectFor(session).id === projectId);
   }
 
   search(machine, url, paginate = true) {
@@ -292,7 +295,7 @@ export class VirtualMachines {
   }
 
   findThread(threadId, machineId) {
-    return this.store.state.sessions.find((session) => id("msg", session.key) === threadId && (!machineId || this.machines.get(session.hostId)?.inboxId === machineId));
+    return this.store.state.sessions.find((session) => hasThreadContent(session) && id("msg", session.key) === threadId && (!machineId || this.machines.get(session.hostId)?.inboxId === machineId));
   }
 
   virtualMessage(session, message, index) {
@@ -464,7 +467,7 @@ export class VirtualMachines {
   }
 
   pinnedSessions(hostId) {
-    return this.store.state.sessions.filter((session) => session.pinnedAt && (!hostId || session.hostId === hostId)).sort((left, right) =>
+    return this.store.state.sessions.filter((session) => hasThreadContent(session) && session.pinnedAt && (!hostId || session.hostId === hostId)).sort((left, right) =>
       (left.pinOrder ?? Number.MAX_SAFE_INTEGER) - (right.pinOrder ?? Number.MAX_SAFE_INTEGER) || left.pinnedAt.localeCompare(right.pinnedAt)
     );
   }

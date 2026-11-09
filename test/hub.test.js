@@ -121,6 +121,15 @@ test("paired host publishes an inbox item and receives a live reply", async (t) 
   assert.equal(approved.status, 200);
   await agent.next((message) => message.type === "paired");
 
+  const emptySessionId = randomUUID();
+  const emptyGeneration = randomUUID();
+  agent.socket.send(JSON.stringify({
+    type: "session_upsert", sessionId: emptySessionId, generation: emptyGeneration,
+    session: { sessionId: emptySessionId, generation: emptyGeneration, cwd: "/workspace/example", name: "example", status: "idle", messages: [] }
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(hub.store.getSession(`${agentIdentity.hostId}:${emptySessionId}`), undefined, "empty startup sessions must not create inbox threads");
+
   const sessionId = randomUUID();
   const generation = randomUUID();
   agent.socket.send(JSON.stringify({
@@ -218,7 +227,7 @@ test("simultaneous Pi processes on one host stay connected", async (t) => {
       type: "session_upsert",
       sessionId,
       generation,
-      session: { sessionId, generation, cwd: `/tmp/${sessionId}`, name: sessionId, status: "idle", messages: [] }
+      session: { sessionId, generation, cwd: `/tmp/${sessionId}`, name: sessionId, status: "idle", messages: [{ id: `${sessionId}-message`, role: "assistant", text: "Ready" }] }
     }));
     await viewer.next((message) => message.type === "session" && message.session?.key === `${agentIdentity.hostId}:${sessionId}`);
     return generation;
@@ -257,7 +266,7 @@ test("inactive agent connections expire after missed heartbeats", async (t) => {
   await agent.next((message) => message.type === "paired");
   const sessionId = randomUUID();
   const generation = randomUUID();
-  agent.socket.send(JSON.stringify({ type: "session_upsert", sessionId, generation, session: { sessionId, generation, cwd: "/tmp/heartbeat", name: "heartbeat", status: "idle", messages: [] } }));
+  agent.socket.send(JSON.stringify({ type: "session_upsert", sessionId, generation, session: { sessionId, generation, cwd: "/tmp/heartbeat", name: "heartbeat", status: "idle", messages: [{ id: "heartbeat-message", role: "assistant", text: "Ready" }] } }));
   await viewer.next((message) => message.type === "session" && message.session?.sessionId === sessionId);
 
   const keepalive = setInterval(() => agent.socket.send(JSON.stringify({ type: "ping" })), 15);

@@ -135,6 +135,18 @@ test("virtual change bursts emit one latest-message notification", async (t) => 
   assert.ok(writes[0].includes("two"));
 });
 
+test("empty startup sessions stay out of Plannotator and deep links", () => {
+  const empty = { key: "host:empty", hostId: "host", sessionId: "empty", cwd: "/workspace", name: "poke-s3", status: "idle", updatedAt: "2026-11-09T13:07:53.989Z", messages: [], remoteReplies: [] };
+  const active = { ...empty, key: "host:active", sessionId: "active", messages: [{ id: "m1", role: "assistant", text: "Ready" }] };
+  const virtual = new VirtualMachines({ dataDir: "/tmp", store: { state: { sessions: [empty, active] } } });
+  const machine = { hostId: "host", inboxId: "machine", cursor: 0 };
+  virtual.machines.set("host", machine);
+  const rows = virtual.list(machine).sections.flatMap((section) => section.threads);
+  assert.deepEqual(rows.map((row) => row.thread_id), [virtual.row(active).thread_id]);
+  assert.equal(virtual.findThread(virtual.row(empty).thread_id), undefined);
+  assert.equal(virtual.session(machine, virtual.row(empty).thread_id), undefined);
+});
+
 test("attachment listing makes one pass over session history", () => {
   const virtual = new VirtualMachines({ dataDir: "/tmp" });
   const session = {
