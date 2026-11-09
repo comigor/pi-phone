@@ -475,6 +475,9 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const viewer = await fetch(`http://127.0.0.1:${addresses.viewer.port}/`);
   assert.equal(viewer.status, 200);
   assert.match(await viewer.text(), /plannotator/i);
+  const worker = await fetch(`http://127.0.0.1:${addresses.viewer.port}/sw.js`);
+  assert.equal(worker.status, 200);
+  assert.match(await worker.text(), /notificationclick/);
 
   agent.close();
   await waitFor(() => hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`)?.online === false);

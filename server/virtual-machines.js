@@ -252,6 +252,24 @@ export class VirtualMachines {
     return [...this.machines.values()].map((machine) => this.search(machine, url, false));
   }
 
+  notificationTarget(item) {
+    const session = this.store.getSession(item.sessionKey);
+    const machine = this.machines.get(item.hostId);
+    if (!session || !machine) return null;
+    let assistantIndex = -1;
+    for (let index = session.messages.length - 1; index >= 0; index--) {
+      if (session.messages[index].role === "assistant") {
+        assistantIndex = index;
+        break;
+      }
+    }
+    return {
+      machine: machine.inboxId,
+      thread: id("msg", session.key),
+      message: assistantIndex >= 0 ? messageId(session, session.messages[assistantIndex], assistantIndex) : null
+    };
+  }
+
   listAll() {
     return [...this.machines.values()].map((machine) => ({ machine: machine.inboxId, model: this.list(machine) }));
   }

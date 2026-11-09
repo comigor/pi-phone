@@ -16,6 +16,9 @@ const PUBLIC_FILES = new Map([
   ["/legacy", "index.html"],
   ["/app.js", "app.js"],
   ["/styles.css", "styles.css"],
+  ["/sw.js", "sw.js"],
+  ["/icon.svg", "icon.svg"],
+  ["/manifest.webmanifest", "manifest.webmanifest"],
 ]);
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -97,6 +100,7 @@ export class InboxHub {
       stopSession: (input) => hub.stopSession(input)
     });
     await hub.virtual.load();
+    push.targetFor = (item) => hub.virtual.notificationTarget(item);
     return hub;
   }
 

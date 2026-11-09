@@ -25,10 +25,21 @@ export class PushDispatcher {
   }
 
   async notify(item) {
+    const target = this.targetFor?.(item);
+    let url = `${this.publicUrl}/session/${encodeURIComponent(item.sessionKey)}`;
+    if (target) {
+      const hash = new URLSearchParams({ machine: target.machine, thread: target.thread });
+      if (target.message) hash.set("msg", target.message);
+      url = `${this.publicUrl}/#${hash}`;
+    }
+    const actions = [{ action: "reply", title: "Reply" }, { action: "read", title: "Mark read" }];
+    if (target?.message) actions.push({ action: "archive", title: "Archive" });
     const payload = JSON.stringify({
       title: `${item.project} is waiting`,
-      body: item.title,
-      url: `${this.publicUrl}/session/${encodeURIComponent(item.sessionKey)}`
+      body: item.body || item.title,
+      ...target,
+      url,
+      actions
     });
     await Promise.all(this.store.state.subscriptions.map(async (subscription) => {
       try {
