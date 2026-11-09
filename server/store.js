@@ -17,7 +17,8 @@ export class InboxStore {
   constructor(dataDir) {
     this.dataDir = dataDir;
     this.stateFile = path.join(dataDir, "state.json");
-    this.writeQueue = Promise.resolve();
+    this.writeVersion = 0;
+    this.writtenVersion = 0;
     this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [] };
   }
 
@@ -34,17 +35,31 @@ export class InboxStore {
     this.state.subscriptions = this.state.subscriptions.filter((item) => item && typeof item.endpoint === "string");
   }
 
+  scheduleWrite() {
+    if (!this.writePending) {
+      this.writePending = (async () => {
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          const version = this.writeVersion;
+          const temporary = `${this.stateFile}.${process.pid}.tmp`;
+          await writeFile(temporary, `${JSON.stringify(this.state)}\n`, { mode: 0o600 });
+          await rename(temporary, this.stateFile);
+          this.writtenVersion = version;
+        } finally {
+          this.writePending = undefined;
+        }
+      })();
+    }
+    return this.writePending;
+  }
+
   async persist() {
-    this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
-      const temporary = `${this.stateFile}.${process.pid}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(this.state)}\n`, { mode: 0o600 });
-      await rename(temporary, this.stateFile);
-    });
-    return this.writeQueue;
+    const version = ++this.writeVersion;
+    while (this.writtenVersion < version) await this.scheduleWrite();
   }
 
   async flush() {
-    await this.writeQueue;
+    while (this.writtenVersion < this.writeVersion) await this.scheduleWrite();
   }
 
   async challengeHost({ hostId, publicKey, name }) {

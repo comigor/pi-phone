@@ -271,3 +271,24 @@ test("inactive agent connections expire after missed heartbeats", async (t) => {
   const offline = await viewer.next((message) => message.type === "state" && message.hosts.find((host) => host.id === agentIdentity.hostId)?.online === false);
   assert.equal(offline.sessions.find((session) => session.sessionId === sessionId).online, false);
 });
+
+test("concurrent session writes drain every version before shutdown", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-writes-"));
+  const store = new InboxStore(dataDir);
+  await store.load();
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const hostId = randomUUID();
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  await store.upsertSession(hostId, { sessionId, generation, status: "idle", messages: [] });
+  await Promise.all(Array.from({ length: 40 }, (_, index) => store.patchSession(hostId, {
+    sessionId,
+    generation,
+    status: "idle",
+    messages: [{ id: `message-${index}`, role: "assistant", text: `message ${index}` }]
+  })));
+  await store.flush();
+  const loaded = new InboxStore(dataDir);
+  await loaded.load();
+  assert.equal(loaded.getSession(`${hostId}:${sessionId}`).messages.length, 40);
+});

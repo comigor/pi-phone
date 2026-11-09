@@ -3,7 +3,6 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import inspector from "node:inspector";
 import { WebSocket, WebSocketServer } from "ws";
 import { InboxStore } from "./store.js";
 import { PushDispatcher } from "./push.js";
@@ -109,13 +108,17 @@ export class InboxHub {
   }
 
   async close() {
+    const serverClosures = [this.agentHttp, this.viewerHttp, this.doorHttp].filter((server) => server.listening).map((server) => new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections();
+    }));
     const agents = [...this.agents.values()].flatMap((sockets) => [...sockets]);
     for (const socket of [...agents, ...this.viewers]) socket.terminate();
     await Promise.all(agents.map((socket) => this.agentClosures.get(socket)));
     for (const retry of this.virtual.linkRetries.values()) clearTimeout(retry);
-    await Promise.all([this.store.flush(), this.virtual.writeQueue]);
     for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
-    await Promise.all([this.agentHttp, this.viewerHttp, this.doorHttp].filter((server) => server.listening).map((server) => new Promise((resolve) => server.close(resolve))));
+    await Promise.all(serverClosures);
+    await Promise.all([this.store.flush(), this.virtual.writeQueue]);
   }
 
   broadcast(value) {
@@ -439,28 +442,6 @@ export class InboxHub {
 }
 
 async function main() {
-  const profiler = new inspector.Session();
-  const profilePost = (method, params) => new Promise((resolve, reject) => profiler.post(method, params, (error, result) => error ? reject(error) : resolve(result)));
-  profiler.connect();
-  await profilePost("Profiler.enable");
-  await profilePost("Profiler.start");
-  setTimeout(async () => {
-    try {
-      const { profile } = await profilePost("Profiler.stop");
-      const total = profile.samples?.length || 1;
-      const top = profile.nodes.filter((node) => node.hitCount).sort((a, b) => b.hitCount - a.hitCount).slice(0, 30).map((node) => ({
-        percent: Math.round(node.hitCount * 1000 / total) / 10,
-        function: node.callFrame.functionName,
-        url: node.callFrame.url,
-        line: node.callFrame.lineNumber + 1
-      }));
-      console.log(`[DEBUG-cpu] ${JSON.stringify({ samples: total, top })}`);
-    } catch (error) {
-      console.error(`[DEBUG-cpu] ${error.stack || error}`);
-    } finally {
-      profiler.disconnect();
-    }
-  }, 10_000);
   const publicUrl = process.env.PUBLIC_URL ?? "http://127.0.0.1:8091";
   const dataDir = process.env.DATA_DIR ?? path.resolve("data");
   const virtualAddress = process.env.VIRTUAL_MACHINE_ADDRESS;
