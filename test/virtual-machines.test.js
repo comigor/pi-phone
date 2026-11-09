@@ -216,12 +216,43 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(publicThread.headers.get("content-encoding"), "gzip");
   assert.equal((await publicThread.json()).thread.messages[0].body, "Remote assistant");
 
+  const publicSearch = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/search?q=Remote+assistant`);
+  assert.equal(publicSearch.status, 200);
+  const searchModel = await publicSearch.json();
+  assert.ok(searchModel.groups.messages.some((message) => message.thread_id === listed.thread_id && message.snippet.text === "Remote assistant"));
+
   const image = opened.thread.messages[0].attachments[0];
   const imageResponse = await fetch(`${forwardedBase}/attachments/${image.id}/image`);
   assert.equal(imageResponse.status, 200);
   assert.equal(Buffer.from(await imageResponse.arrayBuffer()).toString(), "image");
 
   const centralHealth = await (await fetch(`${central}/api/inbox/health`)).json();
+  const archiveWrite = (resolved) => fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/resolve`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, resolved, idempotency_key: `archive-${resolved}-${randomUUID()}` })
+  });
+  assert.equal((await archiveWrite(true)).status, 200);
+  const archivedModel = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads/archived`)).json();
+  assert.ok(archivedModel.threads.some((thread) => thread.thread_id === listed.thread_id && thread.machine === machine.id));
+  await waitFor(async () => {
+    const model = await (await fetch(`${central}/api/inbox/threads?machines=1`)).json();
+    return model.sections.flatMap((section) => section.threads).every((thread) => thread.thread_id !== listed.thread_id) ? model : null;
+  });
+  assert.equal((await archiveWrite(false)).status, 200);
+  const projectArchive = async (resolved) => {
+    const response = await fetch(`${forwardedBase}/projects/${listed.project_id}/resolve`, {
+      method: "POST", headers: { "content-type": "application/json", origin: central },
+      body: JSON.stringify({
+        serverSession: centralHealth.serverSession, resolved, idempotency_key: randomUUID(),
+        ...(resolved ? { batch_id: randomUUID() } : { threads: { resolved: [listed.thread_id], read: [] } })
+      })
+    });
+    const payload = await response.text();
+    assert.equal(response.status, 200, payload);
+    return JSON.parse(payload);
+  };
+  assert.deepEqual((await projectArchive(true)).batch.resolved, [listed.thread_id]);
+  assert.deepEqual((await projectArchive(false)).threads.map((thread) => thread.thread_id), [listed.thread_id]);
   const draft = await fetch(`${forwardedBase}/threads/${listed.thread_id}/draft`);
   assert.equal(draft.status, 200);
   assert.equal((await draft.json()).draft, null);
@@ -390,4 +421,25 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const viewer = await fetch(`http://127.0.0.1:${addresses.viewer.port}/`);
   assert.equal(viewer.status, 200);
   assert.match(await viewer.text(), /plannotator/i);
+
+  agent.close();
+  await waitFor(() => hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`)?.online === false);
+  const offlineReply = await fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: central, "x-plannotator-thread": "contract-session" },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "offline-outbox-contract", words: "Deliver after reconnect", seen_through_seq: opened.cursor })
+  });
+  assert.equal(offlineReply.status, 202);
+  const held = (await offlineReply.json()).outbox;
+  assert.equal(held.key, "offline-outbox-contract");
+  assert.equal(held.words, "Deliver after reconnect");
+  assert.equal(held.thread, "contract-session");
+  const publicOutbox = await waitFor(async () => {
+    const model = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/outbox`)).json();
+    return model.waiting.some((entry) => entry.key === held.key) ? model : null;
+  });
+  const waiting = publicOutbox.waiting.find((entry) => entry.key === held.key);
+  assert.ok(["queued", "sending"].includes(waiting.state));
+  const dismissed = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/outbox/${held.key}/dismiss`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(dismissed.status, 200);
 });

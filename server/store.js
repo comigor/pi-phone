@@ -141,7 +141,8 @@ export class InboxStore {
     const previousMessages = new Map(session.messages.map((message) => [message.id, message]));
     const arrivedAt = new Date().toISOString();
     const nextMessages = cleanMessages(incoming.messages).map((message) => ({ ...message, createdAt: message.createdAt || previousMessages.get(message.id)?.createdAt || arrivedAt }));
-    const changed = session.status !== (incoming.status || "idle") || JSON.stringify(session.messages) !== JSON.stringify(nextMessages);
+    const messagesChanged = JSON.stringify(session.messages) !== JSON.stringify(nextMessages);
+    const changed = session.status !== (incoming.status || "idle") || messagesChanged;
     Object.assign(session, {
       generation: incoming.generation,
       cwd: excerpt(incoming.cwd, 2048),
@@ -153,6 +154,10 @@ export class InboxStore {
       online: true,
       updatedAt: new Date().toISOString()
     });
+    if (messagesChanged && session.resolvedAt && nextMessages.at(-1)?.role === "assistant") {
+      session.resolvedAt = null;
+      session.backFromArchive = true;
+    }
     session.remoteReplies ??= [];
     session.virtualCursor = (session.virtualCursor ?? 0) + (changed ? 1 : 0);
     await this.persist();
@@ -164,15 +169,18 @@ export class InboxStore {
     const session = this.getSession(key);
     if (!session) return undefined;
     let changed = session.status !== (incoming.status || "idle");
+    let messagesChanged = false;
     for (const next of cleanMessages(incoming.messages)) {
       const index = session.messages.findIndex((message) => message.id === next.id);
       next.createdAt ??= session.messages[index]?.createdAt || new Date().toISOString();
       if (index < 0) {
         session.messages.push(next);
         changed = true;
+        messagesChanged = true;
       } else if (JSON.stringify(session.messages[index]) !== JSON.stringify(next)) {
         session.messages[index] = next;
         changed = true;
+        messagesChanged = true;
       }
     }
     Object.assign(session, {
@@ -185,6 +193,10 @@ export class InboxStore {
       online: true,
       updatedAt: new Date().toISOString()
     });
+    if (messagesChanged && session.resolvedAt && session.messages.at(-1)?.role === "assistant") {
+      session.resolvedAt = null;
+      session.backFromArchive = true;
+    }
     session.virtualCursor = (session.virtualCursor ?? 0) + (changed ? 1 : 0);
     await this.persist();
     return session;

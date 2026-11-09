@@ -10,6 +10,7 @@ import { parseMessage, requireString, verifyAgentSignature } from "./protocol.js
 import { VirtualMachines } from "./virtual-machines.js";
 import { PlannotatorRuntime } from "./plannotator.js";
 import { DraftStore } from "./drafts.js";
+import { mergeSearchAnswers } from "./search.js";
 
 const PUBLIC_FILES = new Map([
   ["/legacy", "index.html"],
@@ -398,6 +399,59 @@ export class InboxHub {
     }
   }
 
+  async handleVirtualSearch(request, response, url) {
+    if (url.pathname !== "/api/inbox/search" || request.method !== "GET" || !this.plannotator?.url) return false;
+    const target = new URL(url.pathname + url.search, this.plannotator.url);
+    target.searchParams.set("offset", "0");
+    target.searchParams.set("limit", "50");
+    const upstream = await fetch(target, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+    if (!upstream.ok) {
+      sendJson(response, upstream.status, await upstream.json());
+      return true;
+    }
+    const central = await upstream.json();
+    const merged = mergeSearchAnswers([central, ...this.virtual.searchAll(url)], url.searchParams);
+    merged.serverSession = central.serverSession;
+    sendJson(response, 200, merged);
+    return true;
+  }
+
+  async handleVirtualArchived(request, response, url) {
+    if (url.pathname !== "/api/inbox/threads/archived" || request.method !== "GET" || !this.plannotator?.url) return false;
+    const target = new URL(url.pathname + url.search, this.plannotator.url);
+    target.searchParams.set("offset", "0");
+    target.searchParams.set("limit", "100");
+    const upstream = await fetch(target, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+    if (!upstream.ok) {
+      sendJson(response, upstream.status, await upstream.json());
+      return true;
+    }
+    const central = await upstream.json();
+    const models = [central, ...this.virtual.archivedAll(url)];
+    const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "50", 10) || 50));
+    const projects = new Map();
+    for (const model of models) {
+      for (const project of model.projects || []) {
+        const current = projects.get(project.id) || { ...project, archived: 0 };
+        current.archived += project.archived;
+        projects.set(project.id, current);
+      }
+    }
+    const threads = models.flatMap((model) => model.threads || []).sort((left, right) => String(right.last_at).localeCompare(String(left.last_at)));
+    sendJson(response, 200, {
+      serverSession: central.serverSession,
+      cursor: Math.max(...models.map((model) => model.cursor || 0)),
+      project: url.searchParams.get("project") || null,
+      projects: [...projects.values()],
+      total: models.reduce((total, model) => total + (model.total || 0), 0),
+      offset,
+      limit,
+      threads: threads.slice(offset, offset + limit)
+    });
+    return true;
+  }
+
   async handleVirtualDraft(request, response, url) {
     const match = url.pathname.match(/^\/api\/inbox\/(?:m\/([^/]+)\/)?threads\/([^/]+)\/draft(\/delete)?$/);
     if (!match) return false;
@@ -468,6 +522,8 @@ export class InboxHub {
       if (url.pathname === "/api/inbox/tidy" && request.method === "GET" && this.virtual.hasProject(url.searchParams.get("project"))) {
         return sendJson(response, 200, { serverSession: this.plannotator?.serverSession, count: 0, agents: [], run: null });
       }
+      if (await this.handleVirtualSearch(request, response, url)) return;
+      if (await this.handleVirtualArchived(request, response, url)) return;
       if (await this.handleVirtualDraft(request, response, url)) return;
       if (this.plannotator && !PUBLIC_FILES.has(url.pathname) && !url.pathname.startsWith("/session/")) return this.plannotator.proxy(request, response);
       if (request.method !== "GET" && request.method !== "HEAD") return sendJson(response, 404, { error: "Not found" });

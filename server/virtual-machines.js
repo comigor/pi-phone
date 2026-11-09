@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { paginateSearchAnswer, searchVirtualSessions } from "./search.js";
 
 const ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
@@ -238,6 +239,19 @@ export class VirtualMachines {
     return this.store.state.sessions.some((session) => projectFor(session).id === projectId);
   }
 
+  search(machine, url, paginate = true) {
+    const answer = searchVirtualSessions(this.sessions(machine), url.searchParams, {
+      projectFor,
+      row: (session) => this.row(session),
+      messagesFor: (session) => this.messagesFor(session)
+    });
+    return paginate ? paginateSearchAnswer(answer, url.searchParams) : answer;
+  }
+
+  searchAll(url) {
+    return [...this.machines.values()].map((machine) => this.search(machine, url, false));
+  }
+
   session(machine, threadId) {
     return this.sessions(machine).find((session) => id("msg", session.key) === threadId);
   }
@@ -345,8 +359,8 @@ export class VirtualMachines {
       waiting_on_person: waiting,
       unsent: null,
       delivery: null,
-      agent_after_archive: false,
-      back_from_archive: false,
+      agent_after_archive: Boolean(session.agentAfterArchive),
+      back_from_archive: Boolean(session.backFromArchive),
       read_at: session.readAt || null,
       ack: null,
       project: { id: project.id, name: project.name },
@@ -381,13 +395,43 @@ export class VirtualMachines {
     };
   }
 
-  list(machine) {
-    const sessions = this.sessions(machine);
-    const rows = sessions.map((session) => this.row(session));
-    const projects = [...new Map(sessions.map((session) => {
+  projectRows(sessions) {
+    const projects = new Map();
+    for (const session of sessions) {
       const project = projectFor(session);
-      return [project.id, { ...project, key: project.id, created_at: session.createdAt || session.updatedAt, threads: 1, unread: session.readAt ? 0 : 1, listed: 1, archived: 0 }];
-    })).values()];
+      const current = projects.get(project.id) || { ...project, key: project.id, created_at: session.createdAt || session.updatedAt, threads: 0, unread: 0, listed: 0, archived: 0 };
+      current.threads += 1;
+      if (session.resolvedAt) current.archived += 1;
+      else {
+        current.listed += 1;
+        if (!session.readAt) current.unread += 1;
+      }
+      projects.set(project.id, current);
+    }
+    return [...projects.values()];
+  }
+
+  archived(machine, url, paginate = true) {
+    const project = url.searchParams.get("project") || null;
+    const archived = this.sessions(machine).filter((session) => session.resolvedAt && (!project || projectFor(session).id === project));
+    const rows = archived.map((session) => ({ ...this.row(session), machine: machine.inboxId })).sort((left, right) => right.last_at.localeCompare(left.last_at));
+    const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "50", 10) || 50));
+    return {
+      serverSession: id("srv", machine.hostId), cursor: machine.cursor || 0, project,
+      projects: this.projectRows(this.sessions(machine).filter((session) => session.resolvedAt)).map((item) => ({ id: item.id, name: item.name, archived: item.archived })),
+      total: rows.length, offset, limit, threads: paginate ? rows.slice(offset, offset + limit) : rows
+    };
+  }
+
+  archivedAll(url) {
+    return [...this.machines.values()].map((machine) => this.archived(machine, url, false));
+  }
+
+  list(machine) {
+    const all = this.sessions(machine);
+    const rows = all.filter((session) => !session.resolvedAt).map((session) => this.row(session));
+    const projects = this.projectRows(all);
     const section = (sectionId, label) => ({ id: sectionId, label, threads: rows.filter((row) => row.section === sectionId) });
     return {
       serverSession: id("srv", machine.hostId),
@@ -660,9 +704,9 @@ export class VirtualMachines {
     if (route === "events") return this.events(machine, request, response);
     if (route === "threads" && request.method === "GET") return send(response, 200, this.list(machine));
     if (route === "projects" && request.method === "GET") return send(response, 200, { projects: this.list(machine).projects });
-    if (route === "threads/archived" && request.method === "GET") return send(response, 200, { threads: [] });
+    if (route === "threads/archived" && request.method === "GET") return send(response, 200, this.archived(machine, url));
     if (route === "sessions" && request.method === "GET") return send(response, 200, this.sessionList(machine));
-    if (route === "search" && request.method === "GET") return send(response, 200, { results: [] });
+    if (route === "search" && request.method === "GET") return send(response, 200, { serverSession: id("srv", machine.hostId), ...this.search(machine, url) });
     if (route === "skills" && request.method === "GET") return send(response, 200, { skills: [] });
     if (route === "skills/content" && request.method === "GET") return send(response, 200, { content: "" });
     if (route === "messages" && request.method === "POST") {
@@ -756,6 +800,28 @@ export class VirtualMachines {
       await this.changed(session);
       return send(response, 200, { message: this.controlMessage(session) });
     }
+    match = route.match(new RegExp("^projects/([^/]+)/resolve$"));
+    if (match && request.method === "POST") {
+      const body = await bodyJson(request);
+      const resolved = body.resolved !== false;
+      const wanted = resolved ? null : new Set(Array.isArray(body.threads?.resolved) ? body.threads.resolved : []);
+      const sessions = this.sessions(machine).filter((session) => projectFor(session).id === match[1] && (!wanted || wanted.has(id("msg", session.key))));
+      if (!sessions.length) return send(response, 404, { code: "project_not_found" });
+      const resolvedAt = resolved ? new Date().toISOString() : null;
+      const changedSessions = sessions.filter((session) => Boolean(session.resolvedAt) !== resolved);
+      for (const session of changedSessions) {
+        await this.store.updateVirtualSession(session.key, { resolvedAt, backFromArchive: false });
+        await this.changed(session, { row: this.row(session) });
+      }
+      if (!resolved) return send(response, 200, { threads: changedSessions.map((session) => this.row(session)), skipped: [] });
+      return send(response, 200, {
+        project: this.projectRows(sessions)[0] || null,
+        batch: { resolved: changedSessions.map((session) => id("msg", session.key)), read: [] },
+        threads: changedSessions.map((session) => this.row(session)),
+        replayed: false
+      });
+    }
+
     match = route.match(new RegExp("^messages/([^/]+)/resolve$"));
     if (match && request.method === "POST") {
       const session = this.findByMessage(machine, match[1]);
