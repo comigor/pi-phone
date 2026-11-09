@@ -69,7 +69,7 @@ export class InboxHub {
     this.viewerWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     this.agentHttp = createServer((request, response) => this.handleAgentHttp(request, response));
     this.viewerHttp = createServer((request, response) => this.handleViewerHttp(request, response));
-    this.doorHttp = createServer((request, response) => this.virtual.route(request, response).catch((error) => sendJson(response, 400, { error: error.message })));
+    this.doorHttp = createServer((request, response) => this.virtual.route(request, response).catch((error) => sendJson(response, error.code === "session_offline" ? 503 : 400, { code: error.code || "delivery_failed", error: error.message })));
     this.agentHttp.on("upgrade", (request, socket, head) => this.handleAgentUpgrade(request, socket, head));
     this.viewerHttp.on("upgrade", (request, socket, head) => this.handleViewerUpgrade(request, socket, head));
     this.agentWss.on("connection", (socket, _request, host) => this.handleAgentSocket(socket, host));
@@ -114,7 +114,7 @@ export class InboxHub {
     }));
     const agents = [...this.agents.values()].flatMap((sockets) => [...sockets]);
     for (const socket of [...agents, ...this.viewers]) socket.terminate();
-    await Promise.all(agents.map((socket) => this.agentClosures.get(socket)));
+    await Promise.all([...this.agentClosures.values()]);
     for (const retry of this.virtual.linkRetries.values()) clearTimeout(retry);
     for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
     await Promise.all(serverClosures);
@@ -179,19 +179,23 @@ export class InboxHub {
       if (Date.now() - lastSeenAt >= this.agentHeartbeatTimeoutMs) socket.terminate();
     }, this.agentHeartbeatCheckMs);
     heartbeat.unref();
-    socket.on("message", async (raw) => {
+    let messageQueue = Promise.resolve();
+    socket.on("message", (raw) => {
       lastSeenAt = Date.now();
-      try {
-        const message = parseMessage(raw);
-        if (!message) return socketSend(socket, { type: "error", error: "Invalid message" });
-        if (!host.paired) return socketSend(socket, { type: "pairing_required", pairingCode: host.pairingCode });
-        await this.handleAgentMessage(host, socket, message);
-      } catch (error) {
-        socketSend(socket, { type: "error", error: error.message });
-      }
+      messageQueue = messageQueue.then(async () => {
+        try {
+          const message = parseMessage(raw);
+          if (!message) return socketSend(socket, { type: "error", error: "Invalid message" });
+          if (!host.paired) return socketSend(socket, { type: "pairing_required", pairingCode: host.pairingCode });
+          await this.handleAgentMessage(host, socket, message);
+        } catch (error) {
+          socketSend(socket, { type: "error", error: error.message });
+        }
+      });
     });
     socket.on("close", async () => {
       clearInterval(heartbeat);
+      await messageQueue;
       try {
         const sockets = this.agents.get(host.id);
         if (!sockets?.delete(socket)) return;
@@ -326,11 +330,12 @@ export class InboxHub {
 
   agentRoute(key, generation) {
     const session = this.store.getSession(key);
-    if (!session || !session.online || session.generation !== generation) throw new Error("Session is offline or changed");
+    if (!session || !session.online) throw Object.assign(new Error("Session is offline"), { code: "session_offline" });
+    if (session.generation !== generation) throw Object.assign(new Error("Session changed"), { code: "session_changed" });
     const host = this.store.getHost(session.hostId);
     const route = this.sessionAgents.get(key);
     const agent = route?.generation === generation ? route.socket : undefined;
-    if (!host?.paired || !agent || agent.readyState !== WebSocket.OPEN) throw new Error("Session is offline");
+    if (!host?.paired || !agent || agent.readyState !== WebSocket.OPEN) throw Object.assign(new Error("Session is offline"), { code: "session_offline" });
     return { session, agent };
   }
 
@@ -354,12 +359,14 @@ export class InboxHub {
 
   deliverReply({ key, generation, requestId, text, attachments = [] }) {
     requireString(text, "text", 32_000);
-    const { session } = this.agentRoute(key, generation);
-    return this.requestAgent(key, generation, requestId, {
+    const current = this.store.getSession(key);
+    const effectiveGeneration = current?.online ? current.generation : generation;
+    const { session } = this.agentRoute(key, effectiveGeneration);
+    return this.requestAgent(key, session.generation, requestId, {
       type: "reply",
       requestId,
       sessionId: session.sessionId,
-      generation,
+      generation: session.generation,
       text,
       attachments: attachments.map((attachment) => ({
         name: attachment.name,

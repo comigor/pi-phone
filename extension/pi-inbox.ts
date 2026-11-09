@@ -94,6 +94,7 @@ class PiInboxRuntime {
   private disposed = false;
   private pairingCode?: string;
   private latestSnapshot: Snapshot;
+  private replyResults = new Map<string, { ok: boolean; error?: string }>();
 
   constructor(private pi: ExtensionAPI, private ctx: ExtensionContext) {
     this.latestSnapshot = buildSnapshot(ctx, this.generation, ctx.isIdle() ? "idle" : "running");
@@ -215,6 +216,11 @@ class PiInboxRuntime {
     }
 
     if (message.type !== "reply") return;
+    const previous = this.replyResults.get(message.requestId);
+    if (previous) {
+      this.send({ type: "reply_result", requestId: message.requestId, sessionId: this.latestSnapshot.sessionId, generation: this.generation, ...previous });
+      return;
+    }
     try {
       if (message.sessionId !== this.latestSnapshot.sessionId || message.generation !== this.generation) throw new Error("Session changed");
       if (typeof message.text !== "string" || message.text.length === 0) throw new Error("Empty reply");
@@ -239,18 +245,20 @@ class PiInboxRuntime {
       ] : text;
       if (this.ctx.isIdle()) this.pi.sendUserMessage(content);
       else this.pi.sendUserMessage(content, { deliverAs: "followUp" });
-      this.send({ type: "reply_result", requestId: message.requestId, sessionId: this.latestSnapshot.sessionId, generation: this.generation, ok: true });
+      this.completeReply(message.requestId, { ok: true });
       this.snapshot(this.ctx.isIdle() ? "idle" : "running");
     } catch (error) {
-      this.send({
-        type: "reply_result",
-        requestId: message.requestId,
-        sessionId: this.latestSnapshot.sessionId,
-        generation: this.generation,
-        ok: false,
-        error: error instanceof Error ? error.message : "Reply failed"
-      });
+      this.completeReply(message.requestId, { ok: false, error: error instanceof Error ? error.message : "Reply failed" });
     }
+  }
+
+  private completeReply(requestId: string, result: { ok: boolean; error?: string }) {
+    this.replyResults.set(requestId, result);
+    if (this.replyResults.size > 256) {
+      const oldestReply = this.replyResults.keys().next().value;
+      if (oldestReply) this.replyResults.delete(oldestReply);
+    }
+    this.send({ type: "reply_result", requestId, sessionId: this.latestSnapshot.sessionId, generation: this.generation, ...result });
   }
 
   private send(message: Record<string, unknown>) {

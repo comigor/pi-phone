@@ -292,3 +292,47 @@ test("concurrent session writes drain every version before shutdown", async (t) 
   await loaded.load();
   assert.equal(loaded.getSession(`${hostId}:${sessionId}`).messages.length, 40);
 });
+
+test("replies follow the current generation and offline delivery is retryable", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-reconnect-"));
+  const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, doorPort: 0, host: "127.0.0.1" });
+  const addresses = hub.addresses();
+  const viewerBase = `http://127.0.0.1:${addresses.viewer.port}`;
+  const viewer = await openSocket(`ws://127.0.0.1:${addresses.viewer.port}/ws`);
+  const agentIdentity = identity();
+  const agent = await connectAgent(addresses.agent, agentIdentity);
+  t.after(async () => {
+    viewer.socket.terminate();
+    agent.socket.terminate();
+    await hub.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await agent.next((message) => message.type === "pairing_required");
+  await fetch(`${viewerBase}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await agent.next((message) => message.type === "paired");
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  const sessionKey = `${agentIdentity.hostId}:${sessionId}`;
+  agent.socket.send(JSON.stringify({ type: "session_upsert", sessionId, generation, session: { sessionId, generation, cwd: "/workspace", name: "reconnect", status: "idle", messages: [{ id: "m1", role: "assistant", text: "Ready" }] } }));
+  await viewer.next((message) => message.type === "session" && message.session?.key === sessionKey);
+  const replacement = randomUUID();
+  agent.socket.send(JSON.stringify({ type: "session_upsert", sessionId, generation: replacement, session: { sessionId, generation: replacement, cwd: "/workspace", name: "reconnect", status: "idle", messages: [{ id: "m1", role: "assistant", text: "Ready" }] } }));
+  await viewer.next((message) => message.type === "session" && message.session?.generation === replacement);
+  const delivery = hub.deliverReply({ key: sessionKey, generation, requestId: "after-reload", text: "Continue" });
+  const forwarded = await agent.next((message) => message.type === "reply" && message.requestId === "after-reload");
+  assert.equal(forwarded.generation, replacement);
+  agent.socket.send(JSON.stringify({ type: "reply_result", requestId: "after-reload", sessionId, generation: replacement, ok: true }));
+  await delivery;
+  const messageId = hub.virtual.messagesFor(hub.store.getSession(sessionKey))[0].id;
+  hub.virtual.machines.set(agentIdentity.hostId, { hostId: agentIdentity.hostId, inboxId: "ibx_test", token: "test-token", cursor: 0 });
+  agent.socket.terminate();
+  await viewer.next((message) => message.type === "state" && message.sessions.find((item) => item.key === sessionKey)?.online === false);
+  const offline = await fetch(`http://127.0.0.1:${addresses.door.port}/api/inbox/device/messages/${messageId}/reply`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+    body: JSON.stringify({ idempotency_key: "offline-reply", words: "Send later" })
+  });
+  assert.equal(offline.status, 503);
+  assert.equal((await offline.json()).code, "session_offline");
+});
