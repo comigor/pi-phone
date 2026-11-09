@@ -149,6 +149,21 @@ test("attachment listing makes one pass over session history", () => {
   assert.equal(attachments[0].data.toString(), "image");
 });
 
+test("Artifacts exposes the complete viewer attachment contract", () => {
+  const virtual = new VirtualMachines({ dataDir: "/tmp" });
+  const message = { id: "image-message", role: "assistant", text: "Screenshot", createdAt: "2026-11-08T23:00:00.000Z", images: [{ name: "image-1.png", data: "aW1hZ2U=", mimeType: "image/png" }] };
+  const session = { key: "host:session", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z", messages: [message], remoteReplies: [] };
+  const attachment = virtual.attachmentsModel(session).attachments[0];
+  for (const field of ["path", "named_path", "sent_sha256", "sent_at", "sent_mtime", "message_id", "current", "changed_since_sent", "unavailable", "media_type"]) {
+    assert.notEqual(attachment[field], undefined, `${field} is required by AttachmentPane`);
+  }
+  assert.equal(attachment.path, "image-1.png");
+  assert.equal(attachment.message_id, virtual.virtualMessage(session, message, 0).id);
+  assert.equal(attachment.current.sha256, attachment.sent_sha256);
+  assert.equal(attachment.changed_since_sent, false);
+  assert.equal(attachment.unavailable, null);
+});
+
 test("an unchanged Plannotator links to a virtual Pi host and controls its session", { skip: !available, timeout: 60_000 }, async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-virtual-"));
   const agentIdentity = identity();

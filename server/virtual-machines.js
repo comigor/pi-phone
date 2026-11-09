@@ -88,18 +88,31 @@ function messageId(session, message, index) {
   return id("msg", session.key, message.id || `message-${index}`);
 }
 
-function attachmentFor(session, message, attachment, index) {
+function attachmentFor(session, message, attachment, index, messageIndex = index) {
   const data = attachment.data ? Buffer.from(attachment.data, "base64") : Buffer.alloc(0);
   const mimeType = sniffMimeType(data, attachment.mimeType || attachment.mime_type);
+  const name = attachment.name || `image-${index + 1}.png`;
+  const sha256 = createHash("sha256").update(data).digest("hex");
+  const sentAt = message.createdAt || session.updatedAt;
   return {
     id: id("att", session.key, message.id, attachment.name || `image-${index}`, index),
-    name: attachment.name || `image-${index + 1}.png`,
+    path: attachment.path || name,
+    named_path: attachment.named_path || null,
+    name,
     kind: mimeType.startsWith("image/") ? "image" : "file",
     size: data.length,
     data,
-    mimeType
+    mimeType,
+    media_type: mimeType,
+    sent_sha256: sha256,
+    sent_at: sentAt,
+    sent_mtime: sentAt,
+    message_id: messageId(session, message, messageIndex),
+    current: { sha256, size: data.length, mtime: sentAt },
+    changed_since_sent: false,
+    unavailable: null
   };
-};
+}
 
 function matchesPersistedReply(message, reply) {
   if (message.role !== "user" || typeof message.text !== "string") return false;
@@ -285,7 +298,7 @@ export class VirtualMachines {
   virtualMessage(session, message, index) {
     const project = projectFor(session);
     const mid = messageId(session, message, index);
-    const attachments = (message.attachments || message.images || []).map((item, attachmentIndex) => attachmentFor(session, message, item, attachmentIndex));
+    const attachments = (message.attachments || message.images || []).map((item, attachmentIndex) => attachmentFor(session, message, item, attachmentIndex, index));
     return {
       id: mid,
       project_id: project.id,
@@ -562,7 +575,7 @@ export class VirtualMachines {
 
   persistedAttachments(session) {
     const messages = [...session.messages, ...(session.remoteReplies || [])];
-    return messages.flatMap((message) => (message.attachments || message.images || []).map((item, index) => attachmentFor(session, message, item, index)));
+    return messages.flatMap((message, messageIndex) => (message.attachments || message.images || []).map((item, index) => attachmentFor(session, message, item, index, messageIndex)));
   }
 
   attachmentsModel(session) {
