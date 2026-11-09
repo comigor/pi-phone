@@ -253,22 +253,34 @@ export class VirtualMachines {
     };
   }
 
-  messagesFor(session) {
+  sourceMessagesFor(session) {
     const unmatchedReplies = [...(session.remoteReplies || [])];
     const messages = session.messages.map((message) => {
       const index = unmatchedReplies.findIndex((reply) => matchesPersistedReply(message, reply));
       return index >= 0 ? unmatchedReplies.splice(index, 1)[0] : message;
     });
     messages.push(...unmatchedReplies);
+    return messages;
+  }
+
+  messagesFor(session) {
+    const messages = this.sourceMessagesFor(session);
     const result = messages.map((message, index) => this.virtualMessage(session, message, index));
     if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) result.push(this.controlMessage(session));
     return result;
   }
 
+  lastMessage(session, messages = this.sourceMessagesFor(session)) {
+    if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) return this.controlMessage(session);
+    const last = messages.at(-1);
+    return last ? this.virtualMessage(session, last, messages.length - 1) : this.controlMessage(session);
+  }
+
   row(session) {
     const project = projectFor(session);
-    const messages = this.messagesFor(session);
-    const last = messages.at(-1);
+    const sourceMessages = this.sourceMessagesFor(session);
+    const last = this.lastMessage(session, sourceMessages);
+    const messageCount = sourceMessages.length + (session.status === "running" || session.status === "waiting" || session.stopRequestedAt ? 1 : 0);
     const waiting = session.status !== "running";
     return {
       thread_id: id("msg", session.key),
@@ -278,7 +290,7 @@ export class VirtualMachines {
       created_at: session.createdAt || session.updatedAt,
       last_at: session.updatedAt,
       last_author: last?.author.kind || "agent",
-      message_count: messages.length,
+      message_count: messageCount,
       resolved_at: session.resolvedAt || null,
       questions: { open: 0, picked: 0, stopped: false, holds_up: [], prompt: null, actions: 0 },
       waiting_on_person: waiting,
@@ -484,7 +496,7 @@ export class VirtualMachines {
     if (!machine) return;
     machine.cursor = (machine.cursor || 0) + 1;
     await this.persist();
-    const data = JSON.stringify(record || { message: this.messagesFor(session).at(-1) || this.controlMessage(session) });
+    const data = JSON.stringify(record || { message: this.lastMessage(session) });
     for (const stream of this.streams.get(machine.hostId) || []) {
       stream.write(`id: ${machine.cursor}\nevent: record\ndata: ${data}\n\n`);
     }
@@ -537,7 +549,7 @@ export class VirtualMachines {
     if (annotationIds.size) await this.store.persist();
     await this.changed(session);
     if (compose) return send(response, 200, { thread_id: id("msg", session.key), message: reply, project: projectFor(session), replayed: false });
-    return send(response, 200, { reply, thread: this.thread(session).thread });
+    return send(response, 200, { reply });
   }
 
   async route(request, response) {

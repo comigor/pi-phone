@@ -78,6 +78,23 @@ test("legacy text-only image replies stay in their original position", () => {
   assert.equal(messages[0].id, virtual.virtualMessage(session, session.remoteReplies[0], 0).id);
 });
 
+test("full-history updates project only the latest message", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-projection-"));
+  const virtual = new VirtualMachines({ dataDir });
+  virtual.machines.set("host", { cursor: 0 });
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const session = {
+    key: "host:session", hostId: "host", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z",
+    messages: Array.from({ length: 1705 }, (_, index) => ({ id: `m${index}`, role: "assistant", text: `Message ${index}`, images: [] })), remoteReplies: []
+  };
+  let projections = 0;
+  const project = virtual.virtualMessage;
+  virtual.virtualMessage = function (...args) { projections++; return project.apply(this, args); };
+  await virtual.changed(session);
+  virtual.row(session);
+  assert.equal(projections, 2);
+});
+
 test("an unchanged Plannotator links to a virtual Pi host and controls its session", { skip: !available, timeout: 60_000 }, async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-virtual-"));
   const agentIdentity = identity();
@@ -158,6 +175,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   agent.send(JSON.stringify({ type: "reply_result", requestId: delivered.requestId, sessionId, generation, ok: true }));
   const reply = await replyResponse;
   assert.equal(reply.status, 200);
+  assert.equal((await reply.json()).thread, undefined);
 
   const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from("person-image")]);
   const upload = await fetch(`${forwardedBase}/uploads?name=person.png&idempotency_key=upload-contract`, {
