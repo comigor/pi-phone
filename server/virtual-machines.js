@@ -525,7 +525,6 @@ export class VirtualMachines {
     }
     const combined = [typeof words === "string" ? words.trim() : "", feedback].filter(Boolean).join("\n\n");
     const text = combined || (attachments.every((attachment) => attachment.mimeType?.startsWith("image/")) ? "Image attached" : "Files attached");
-    if (!compose && body.seen_through_seq !== session.virtualCursor) return send(response, 409, { code: "thread_moved_on", error: "Read the latest thread before replying" });
     const previous = (session.remoteReplies || []).find((message) => message.requestId === key);
     if (previous) return send(response, 200, { reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
     await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });

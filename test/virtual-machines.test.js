@@ -151,7 +151,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const replyResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
     method: "POST",
     headers: { "content-type": "application/json", origin: central },
-    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "reply-contract", words: "Continue remotely", seen_through_seq: opened.cursor })
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "reply-contract", words: "Continue remotely", seen_through_seq: opened.cursor - 1 })
   });
   const delivered = await replyDelivery;
   assert.equal(delivered.text, "Continue remotely");
