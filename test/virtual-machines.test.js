@@ -163,8 +163,20 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(imageResponse.status, 200);
   assert.equal(Buffer.from(await imageResponse.arrayBuffer()).toString(), "image");
 
-  const replyDelivery = nextMessage(agent, "reply");
   const centralHealth = await (await fetch(`${central}/api/inbox/health`)).json();
+  const draft = await fetch(`${forwardedBase}/threads/${listed.thread_id}/draft`);
+  assert.equal(draft.status, 200);
+  assert.equal((await draft.json()).draft, null);
+  const taggable = await fetch(`${forwardedBase}/threads/${listed.thread_id}/taggable`);
+  assert.equal(taggable.status, 200);
+  assert.ok((await taggable.json()).sessions.some((item) => item.session === sessionId && item.owner && item.taggable));
+  const tidy = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/tidy?project=${listed.project_id}`);
+  assert.equal(tidy.status, 200);
+  assert.deepEqual(await tidy.json(), { serverSession: centralHealth.serverSession, count: 0, agents: [], run: null });
+  const outbox = await fetch(`${central}/api/inbox/outbox`);
+  assert.equal(outbox.status, 200);
+  assert.deepEqual(await outbox.json(), { waiting: [], notices: [] });
+  const replyDelivery = nextMessage(agent, "reply");
   const replyResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
     method: "POST",
     headers: { "content-type": "application/json", origin: central },

@@ -35,6 +35,9 @@ export class PlannotatorRuntime {
     try {
       status = JSON.parse(stdout);
       this.url = new URL(status.url);
+      const healthResponse = await fetch(new URL("/api/inbox/health", this.url), { signal: AbortSignal.timeout(10_000) });
+      if (!healthResponse.ok) throw new Error("Plannotator health check failed");
+      this.serverSession = (await healthResponse.json()).serverSession;
     } catch {
       throw new Error("Plannotator returned an invalid status response");
     }

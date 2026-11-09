@@ -203,6 +203,10 @@ export class VirtualMachines {
     return this.store.state.sessions.filter((session) => session.hostId === machine.hostId);
   }
 
+  hasProject(projectId) {
+    return this.store.state.sessions.some((session) => projectFor(session).id === projectId);
+  }
+
   session(machine, threadId) {
     return this.sessions(machine).find((session) => id("msg", session.key) === threadId);
   }
@@ -370,6 +374,22 @@ export class VirtualMachines {
       wrote_thread: true,
       send_now: true,
       last_thread: { id: id("msg", session.key), subject: session.name, at: session.updatedAt }
+    };
+  }
+
+  taggable(session) {
+    const project = projectFor(session);
+    const owner = { host: "pi", session: session.sessionId };
+    return {
+      serverSession: id("srv", session.hostId),
+      owner,
+      sessions: [{
+        session: session.sessionId, host: "pi", kind: "live", name: null,
+        project: { id: project.id, name: project.name, root: project.root },
+        started_at: session.createdAt || session.updatedAt, last_at: session.updatedAt,
+        busy: session.status === "running", idle_since: session.status === "running" ? null : session.updatedAt,
+        taggable: true, owner: true, wrote_thread: true
+      }]
     };
   }
 
@@ -588,6 +608,16 @@ export class VirtualMachines {
     if (match && request.method === "GET") {
       const upload = this.uploads.get(match[1]);
       return upload ? send(response, 200, { text: upload.data.toString("utf8") }) : send(response, 404, { code: "upload_not_found" });
+    }
+    match = route.match(new RegExp("^threads/([^/]+)/draft$"));
+    if (match && request.method === "GET") {
+      const session = this.session(machine, match[1]);
+      return session ? send(response, 200, { serverSession: id("srv", session.hostId), draft: null }) : send(response, 404, { code: "thread_not_found" });
+    }
+    match = route.match(new RegExp("^threads/([^/]+)/taggable$"));
+    if (match && request.method === "GET") {
+      const session = this.session(machine, match[1]);
+      return session ? send(response, 200, this.taggable(session)) : send(response, 404, { code: "thread_not_found" });
     }
     match = route.match(new RegExp("^threads/([^/]+)/attachments$"));
     if (match && request.method === "GET") {

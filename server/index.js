@@ -420,6 +420,9 @@ export class InboxHub {
         this.broadcastState();
         return sendJson(response, 200, { ok: true });
       }
+      if (url.pathname === "/api/inbox/tidy" && request.method === "GET" && this.virtual.hasProject(url.searchParams.get("project"))) {
+        return sendJson(response, 200, { serverSession: this.plannotator?.serverSession, count: 0, agents: [], run: null });
+      }
       if (this.plannotator && !PUBLIC_FILES.has(url.pathname) && !url.pathname.startsWith("/session/")) return this.plannotator.proxy(request, response);
       if (request.method !== "GET" && request.method !== "HEAD") return sendJson(response, 404, { error: "Not found" });
       const filename = PUBLIC_FILES.get(url.pathname) ?? (url.pathname.startsWith("/session/") ? "index.html" : undefined);
