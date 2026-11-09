@@ -225,6 +225,26 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const draft = await fetch(`${forwardedBase}/threads/${listed.thread_id}/draft`);
   assert.equal(draft.status, 200);
   assert.equal((await draft.json()).draft, null);
+
+  const uploadResponse = await fetch(`${forwardedBase}/uploads?name=note.txt`, { method: "POST", headers: { "content-type": "text/plain" }, body: "persisted upload" });
+  const draftUpload = (await uploadResponse.json()).upload;
+  const reloadedVirtual = new VirtualMachines({ dataDir: path.join(temporary, "relay"), drafts: hub.drafts, store: hub.store });
+  await reloadedVirtual.load();
+  assert.equal(reloadedVirtual.uploads.get(draftUpload.upload_id).data.toString(), "persisted upload");
+
+  const publicDraft = `http://127.0.0.1:${addresses.viewer.port}/api/inbox/m/${machine.id}/threads/${listed.thread_id}/draft`;
+  const savedDraftResponse = await fetch(publicDraft, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body: "Persistent draft", base: null, files: [{ upload_id: draftUpload.upload_id }], all_files: true }) });
+  assert.equal(savedDraftResponse.status, 200);
+  const savedDraft = (await savedDraftResponse.json()).draft;
+  assert.equal(savedDraft.body, "Persistent draft");
+  assert.equal(savedDraft.files[0].upload_id, draftUpload.upload_id);
+  assert.equal((await (await fetch(`${forwardedBase}/threads/${listed.thread_id}/draft`)).json()).draft.body, "Persistent draft");
+  const conflict = await fetch(publicDraft, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body: "Stale editor", base: null }) });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).code, "draft_conflict");
+  const deleted = await fetch(`${publicDraft}/delete`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal((await deleted.json()).deleted, true);
+  assert.equal((await (await fetch(publicDraft)).json()).draft, null);
   const taggable = await fetch(`${forwardedBase}/threads/${listed.thread_id}/taggable`);
   assert.equal(taggable.status, 200);
   assert.ok((await taggable.json()).sessions.some((item) => item.session === sessionId && item.owner && item.taggable));

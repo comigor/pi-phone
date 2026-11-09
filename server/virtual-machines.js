@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -122,6 +122,8 @@ export class VirtualMachines {
     this.linkMachine = options.linkMachine;
     this.publicAddress = options.publicAddress;
     this.file = path.join(options.dataDir, "virtual-machines.json");
+    this.uploadsDir = path.join(options.dataDir, "uploads");
+    this.drafts = options.drafts;
     this.machines = new Map();
     this.streams = new Map();
     this.linkRetries = new Map();
@@ -139,10 +141,24 @@ export class VirtualMachines {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    await mkdir(this.uploadsDir, { recursive: true, mode: 0o700 });
+    for (const name of await readdir(this.uploadsDir)) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const upload = JSON.parse(await readFile(path.join(this.uploadsDir, name), "utf8"));
+        this.uploads.set(upload.upload_id, { ...upload, data: Buffer.from(upload.data, "base64") });
+      } catch {
+      }
+    }
   }
 
   persist() {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(() => writeFile(this.file, JSON.stringify({ machines: [...this.machines.values()] }, null, 2), { mode: 0o600 }));
+    return this.writeQueue;
+  }
+
+  persistUpload(upload) {
+    this.writeQueue = this.writeQueue.catch(() => undefined).then(() => writeFile(path.join(this.uploadsDir, `${upload.upload_id}.json`), JSON.stringify({ ...upload, data: upload.data.toString("base64") }), { mode: 0o600 }));
     return this.writeQueue;
   }
 
@@ -224,6 +240,10 @@ export class VirtualMachines {
 
   session(machine, threadId) {
     return this.sessions(machine).find((session) => id("msg", session.key) === threadId);
+  }
+
+  findThread(threadId, machineId) {
+    return this.store.state.sessions.find((session) => id("msg", session.key) === threadId && (!machineId || this.machines.get(session.hostId)?.inboxId === machineId));
   }
 
   virtualMessage(session, message, index) {
@@ -615,6 +635,7 @@ export class VirtualMachines {
     if (previous) return send(response, 200, { reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
     await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });
     const appended = await this.store.appendRemoteReply(session.key, { requestId: key, text, attachments });
+    if (typeof body.clear_draft === "string") await this.drafts.clearSent(id("msg", session.key), body.clear_draft, combined, Array.isArray(body.uploads) ? body.uploads : []);
     const reply = this.virtualMessage(session, appended.message, session.messages.length);
     const annotationIds = new Set(Array.isArray(body.annotation_ids) ? body.annotation_ids.filter((value) => typeof value === "string") : []);
     for (const record of session.messageAnnotations || []) {
@@ -656,6 +677,7 @@ export class VirtualMachines {
       const name = (url.searchParams.get("name") || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
       const upload = { upload_id: uploadId, name, data: bytes, mimeType: sniffMimeType(bytes, request.headers["content-type"]) };
       this.uploads.set(uploadId, upload);
+      await this.persistUpload(upload);
       return send(response, 200, { upload: { upload_id: uploadId, name, size: bytes.length, mime_type: upload.mimeType } });
     }
     let match = route.match(new RegExp("^uploads/([^/]+)/text$"));
@@ -663,10 +685,18 @@ export class VirtualMachines {
       const upload = this.uploads.get(match[1]);
       return upload ? send(response, 200, { text: upload.data.toString("utf8") }) : send(response, 404, { code: "upload_not_found" });
     }
-    match = route.match(new RegExp("^threads/([^/]+)/draft$"));
-    if (match && request.method === "GET") {
+    match = route.match(new RegExp("^threads/([^/]+)/draft(/delete)?$"));
+    if (match) {
       const session = this.session(machine, match[1]);
-      return session ? send(response, 200, { serverSession: id("srv", session.hostId), draft: null }) : send(response, 404, { code: "thread_not_found" });
+      if (!session) return send(response, 404, { code: "thread_not_found" });
+      if (request.method === "GET" && !match[2]) return send(response, 200, { serverSession: id("srv", session.hostId), draft: this.drafts.get(match[1]) });
+      if (request.method !== "POST") return send(response, 405, { error: "Use GET or POST" });
+      if (match[2]) return send(response, 200, { ok: true, deleted: await this.drafts.delete(match[1]) });
+      try {
+        return send(response, 200, { draft: await this.drafts.save(match[1], await bodyJson(request)) });
+      } catch (error) {
+        return send(response, error.code === "draft_conflict" ? 409 : 422, { code: error.code, error: error.message, draft: error.draft });
+      }
     }
     match = route.match(new RegExp("^threads/([^/]+)/taggable$"));
     if (match && request.method === "GET") {

@@ -9,6 +9,7 @@ import { PushDispatcher } from "./push.js";
 import { parseMessage, requireString, verifyAgentSignature } from "./protocol.js";
 import { VirtualMachines } from "./virtual-machines.js";
 import { PlannotatorRuntime } from "./plannotator.js";
+import { DraftStore } from "./drafts.js";
 
 const PUBLIC_FILES = new Map([
   ["/legacy", "index.html"],
@@ -56,6 +57,7 @@ export class InboxHub {
     this.plannotator = options.plannotator;
     this.publicUrl = options.publicUrl;
     this.store = options.store;
+    this.drafts = options.drafts;
     this.push = options.push;
     this.agentHeartbeatTimeoutMs = options.agentHeartbeatTimeoutMs ?? 60_000;
     this.agentHeartbeatCheckMs = options.agentHeartbeatCheckMs ?? 10_000;
@@ -78,12 +80,15 @@ export class InboxHub {
 
   static async create(options) {
     const store = new InboxStore(options.dataDir);
+    const drafts = new DraftStore(options.dataDir);
     await store.load();
+    await drafts.load();
     const push = new PushDispatcher(options.dataDir, options.publicUrl, store);
     await push.load();
-    const hub = new InboxHub({ ...options, store, push });
+    const hub = new InboxHub({ ...options, store, push, drafts });
     hub.virtual = new VirtualMachines({
       store,
+      drafts,
       dataDir: options.dataDir,
       publicAddress: options.virtualAddress,
       linkMachine: options.linkMachine,
@@ -119,7 +124,7 @@ export class InboxHub {
     for (const streams of this.virtual.streams.values()) for (const stream of streams) stream.end();
     await Promise.all(serverClosures);
     await this.virtual.flushChanges();
-    await Promise.all([this.store.flush(), this.virtual.writeQueue]);
+    await Promise.all([this.store.flush(), this.virtual.writeQueue, this.drafts.writeQueue]);
   }
 
   broadcast(value) {
@@ -393,6 +398,33 @@ export class InboxHub {
     }
   }
 
+  async handleVirtualDraft(request, response, url) {
+    const match = url.pathname.match(/^\/api\/inbox\/(?:m\/([^/]+)\/)?threads\/([^/]+)\/draft(\/delete)?$/);
+    if (!match) return false;
+    const session = this.virtual.findThread(match[2], match[1]);
+    if (!session) return false;
+    const threadId = match[2];
+    if (request.method === "GET" && !match[3]) {
+      sendJson(response, 200, { serverSession: this.plannotator?.serverSession, draft: this.drafts.get(threadId) });
+      return true;
+    }
+    if (request.method !== "POST") {
+      sendJson(response, 405, { error: "Use GET or POST" });
+      return true;
+    }
+    if (match[3]) {
+      sendJson(response, 200, { ok: true, deleted: await this.drafts.delete(threadId) });
+      return true;
+    }
+    try {
+      const draft = await this.drafts.save(threadId, await readJson(request) || {});
+      sendJson(response, 200, { draft });
+    } catch (error) {
+      sendJson(response, error.code === "draft_conflict" ? 409 : 422, { code: error.code, error: error.message, draft: error.draft });
+    }
+    return true;
+  }
+
   async handleViewerHttp(request, response) {
     try {
       const url = new URL(request.url, "http://localhost");
@@ -436,6 +468,7 @@ export class InboxHub {
       if (url.pathname === "/api/inbox/tidy" && request.method === "GET" && this.virtual.hasProject(url.searchParams.get("project"))) {
         return sendJson(response, 200, { serverSession: this.plannotator?.serverSession, count: 0, agents: [], run: null });
       }
+      if (await this.handleVirtualDraft(request, response, url)) return;
       if (this.plannotator && !PUBLIC_FILES.has(url.pathname) && !url.pathname.startsWith("/session/")) return this.plannotator.proxy(request, response);
       if (request.method !== "GET" && request.method !== "HEAD") return sendJson(response, 404, { error: "Not found" });
       const filename = PUBLIC_FILES.get(url.pathname) ?? (url.pathname.startsWith("/session/") ? "index.html" : undefined);
