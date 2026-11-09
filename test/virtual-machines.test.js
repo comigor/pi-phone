@@ -239,6 +239,21 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(opened.thread.messages[0].body, "Remote assistant");
   assert.ok(opened.thread.messages.some((message) => message.body.includes("Stop agent")));
 
+  const centralHealth = await (await fetch(`${central}/api/inbox/health`)).json();
+  const seen = (key, throughSeq) => fetch(`${forwardedBase}/threads/${listed.thread_id}/seen`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: key, through_seq: throughSeq })
+  });
+  const seenResponse = await seen("seen-contract", opened.thread.messages[0].seq);
+  assert.equal(seenResponse.status, 200);
+  assert.equal((await seenResponse.json()).thread.unseen, 0);
+  const afterSeen = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
+  assert.equal(afterSeen.thread.messages[0].person_seen_seq, opened.thread.messages[0].seq);
+  assert.equal(afterSeen.row.unseen, 0);
+  assert.equal((await seen("seen-backwards-contract", 0)).status, 200);
+  const afterBackwardsLook = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
+  assert.equal(afterBackwardsLook.thread.messages[0].person_seen_seq, opened.thread.messages[0].seq);
+
   const publicThread = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/m/${machine.id}/threads/${listed.thread_id}`, { headers: { "accept-encoding": "gzip" } });
   assert.equal(publicThread.headers.get("content-encoding"), "gzip");
   assert.equal((await publicThread.json()).thread.messages[0].body, "Remote assistant");
@@ -253,7 +268,6 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(imageResponse.status, 200);
   assert.equal(Buffer.from(await imageResponse.arrayBuffer()).toString(), "image");
 
-  const centralHealth = await (await fetch(`${central}/api/inbox/health`)).json();
   const archiveWrite = (resolved) => fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/resolve`, {
     method: "POST", headers: { "content-type": "application/json", origin: central },
     body: JSON.stringify({ serverSession: centralHealth.serverSession, resolved, idempotency_key: `archive-${resolved}-${randomUUID()}` })

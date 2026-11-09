@@ -319,6 +319,7 @@ export class VirtualMachines {
       thread_name: null,
       base_path: session.cwd,
       seq: index + 1,
+      ...(index === 0 ? { person_seen_seq: session.seenThroughSeq ?? null } : {}),
       ack: session.acks?.[mid] || null,
       ...(attachments.length ? { attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })) } : {})
     };
@@ -326,7 +327,7 @@ export class VirtualMachines {
 
   cachedVirtualMessage(session, message, index) {
     const mid = messageId(session, message, index);
-    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null]);
+    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null, index === 0 ? session.seenThroughSeq ?? null : null]);
     const cached = this.messageCache.get(message);
     if (cached?.key === key) return cached.value;
     const value = this.virtualMessage(session, message, index);
@@ -377,12 +378,26 @@ export class VirtualMachines {
     return last ? this.cachedVirtualMessage(session, last, messages.length - 1) : this.controlMessage(session);
   }
 
+  lookBoundary(session, messages = this.sourceMessagesFor(session)) {
+    let boundary = session.seenThroughSeq ?? 0;
+    for (const [index, message] of messages.entries()) {
+      if (message.role === "user") boundary = Math.max(boundary, index + 1);
+    }
+    return boundary;
+  }
+
+  unseenCount(session, messages = this.sourceMessagesFor(session)) {
+    const boundary = this.lookBoundary(session, messages);
+    return messages.filter((message, index) => message.role !== "user" && index + 1 > boundary).length;
+  }
+
   row(session) {
     const project = projectFor(session);
     const sourceMessages = this.sourceMessagesFor(session);
     const last = this.lastMessage(session, sourceMessages);
     const messageCount = sourceMessages.length + (session.status === "running" || session.status === "waiting" || session.stopRequestedAt ? 1 : 0);
     const waiting = session.status !== "running";
+    const unseen = this.unseenCount(session, sourceMessages);
     return {
       thread_id: id("msg", session.key),
       project_id: project.id,
@@ -406,12 +421,12 @@ export class VirtualMachines {
       answered_not_sent: false,
       reask_pending: false,
       waiting_since: waiting ? session.updatedAt : null,
-      unseen: session.readAt ? 0 : 1,
+      unseen,
       sent: null,
       guide: false,
       last_agent_at: session.updatedAt,
       section: waiting ? "waiting" : "sent",
-      unread: !session.readAt
+      unread: !session.readAt || unseen > 0
     };
   }
 
@@ -859,10 +874,37 @@ export class VirtualMachines {
         await this.changed(session, { thread_id: id("msg", session.key) }, "snoozes");
         return send(response, 200, { snoozed: until ? { until, at } : null });
       }
-      const read = match[2] === "seen" || match[2] === "read";
-      await this.store.updateVirtualSession(session.key, { readAt: read ? new Date().toISOString() : null });
+      if (match[2] === "seen") {
+        const body = await bodyJson(request);
+        const through = body.through_seq;
+        if (through !== undefined && through !== null && (!Number.isInteger(through) || through < 0)) {
+          return send(response, 422, { code: "validation_error", field: "through_seq", error: "through_seq must be a non-negative integer or null" });
+        }
+        const newest = Math.max(0, ...this.messagesFor(session).map((message) => message.seq || 0));
+        const requested = typeof through === "number" ? Math.min(through, newest) : newest;
+        const seenThroughSeq = Math.max(session.seenThroughSeq ?? 0, requested);
+        if (seenThroughSeq > (session.seenThroughSeq ?? 0)) {
+          await this.store.updateVirtualSession(session.key, { seenThroughSeq });
+          await this.changed(session);
+        }
+        return send(response, 200, { thread: this.row(session) });
+      }
+      if (match[2] === "mark-unread") {
+        const latestAgent = this.messagesFor(session).filter((message) => message.author.kind === "agent" && message.seq > 0).at(-1);
+        const throughSeq = latestAgent ? latestAgent.seq - 1 : 0;
+        await this.store.updateVirtualSession(session.key, { seenThroughSeq: throughSeq });
+        await this.changed(session);
+        return send(response, 200, { thread: this.row(session), wrote: Boolean(latestAgent), through_seq: throughSeq });
+      }
+      const read = match[2] === "read";
+      const latestSeq = Math.max(0, ...this.messagesFor(session).map((message) => message.seq || 0));
+      await this.store.updateVirtualSession(session.key, {
+        readAt: read ? new Date().toISOString() : null,
+        seenThroughSeq: read ? latestSeq : session.seenBeforeRead ?? session.seenThroughSeq ?? 0,
+        seenBeforeRead: read ? session.seenThroughSeq ?? 0 : null
+      });
       await this.changed(session);
-      return send(response, 200, { row: this.row(session) });
+      return send(response, 200, { thread: this.row(session) });
     }
     match = route.match(new RegExp("^messages/([^/]+)/reply$"));
     if (match && request.method === "POST") {
