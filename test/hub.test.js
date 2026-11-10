@@ -287,6 +287,49 @@ test("large histories synchronize without dropping the agent connection", async 
   assert.deepEqual(session.messages.map((message) => message.id), messages.map((message) => message.id));
 });
 
+test("an old close does not close the replacement connection’s event stream", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-"));
+  const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, host: "127.0.0.1" });
+  const agentIdentity = identity();
+  const first = await connectAgent(hub.addresses().agent, agentIdentity);
+  let second;
+  let releaseOffline;
+  const offlineGate = new Promise((resolve) => { releaseOffline = resolve; });
+  let markOfflineStarted;
+  const offlineStarted = new Promise((resolve) => { markOfflineStarted = resolve; });
+  let offlineCalls = 0;
+  hub.virtual.hostOffline = async () => { offlineCalls++; };
+  const setHostOnline = hub.store.setHostOnline.bind(hub.store);
+  hub.store.setHostOnline = async (hostId, online) => {
+    const result = setHostOnline(hostId, online);
+    if (!online) {
+      markOfflineStarted();
+      await offlineGate;
+    }
+    return result;
+  };
+  t.after(async () => {
+    releaseOffline();
+    first.socket.terminate();
+    second?.socket.terminate();
+    await hub.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  await first.next((message) => message.type === "pairing_required");
+  await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await first.next((message) => message.type === "paired");
+  first.socket.close();
+  await offlineStarted;
+  second = await connectAgent(hub.addresses().agent, agentIdentity);
+  await second.next((message) => message.type === "paired");
+  releaseOffline();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(offlineCalls, 0);
+});
+
 test("inactive agent connections expire after missed heartbeats", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-"));
   const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost", agentHeartbeatTimeoutMs: 40, agentHeartbeatCheckMs: 10 });

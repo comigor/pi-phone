@@ -222,7 +222,7 @@ export class InboxHub {
         if (!sockets.size) {
           this.agents.delete(host.id);
           await this.store.setHostOnline(host.id, false);
-          await this.virtual.hostOffline(host.id);
+          if (!this.agents.has(host.id)) await this.virtual.hostOffline(host.id);
         }
         this.broadcastState();
       } finally {
