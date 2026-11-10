@@ -219,6 +219,26 @@ export class InboxStore {
     return { session, message, replayed: false };
   }
 
+  async queueRemoteReply(key, pending) {
+    const session = this.getSession(key);
+    if (!session) throw new Error("Unknown session");
+    session.pendingReplies ??= [];
+    const previous = session.pendingReplies.find((reply) => reply.requestId === pending.requestId);
+    if (previous) return { session, pending: previous, replayed: true };
+    const queued = { ...pending, queuedAt: new Date().toISOString() };
+    session.pendingReplies.push(queued);
+    session.virtualCursor = (session.virtualCursor ?? 0) + 1;
+    await this.persist();
+    return { session, pending: queued, replayed: false };
+  }
+
+  async completeRemoteReply(key, requestId) {
+    const session = this.getSession(key);
+    if (!session) return;
+    session.pendingReplies = (session.pendingReplies || []).filter((reply) => reply.requestId !== requestId);
+    await this.persist();
+  }
+
   async updateVirtualSession(key, update) {
     const session = this.getSession(key);
     if (!session) throw new Error("Unknown session");

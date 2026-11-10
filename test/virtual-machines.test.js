@@ -176,6 +176,59 @@ test("Artifacts exposes the complete viewer attachment contract", () => {
   assert.equal(attachment.unavailable, null);
 });
 
+test("offline replies are accepted and delivered on reconnect", async (t) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-offline-reply-"));
+  const hub = await InboxHub.create({ dataDir: temporary, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, doorPort: 0, host: "127.0.0.1" });
+  const agentIdentity = identity();
+  const agent = await connectAgent(hub.addresses().agent, agentIdentity);
+  let reconnected;
+  t.after(async () => {
+    agent.terminate();
+    reconnected?.terminate();
+    await hub.close();
+    await rm(temporary, { recursive: true, force: true });
+  });
+  await nextMessage(agent, "pairing_required");
+  const paired = nextMessage(agent, "paired");
+  await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await paired;
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  agent.send(JSON.stringify({
+    type: "session_upsert", sessionId, generation,
+    session: { sessionId, generation, cwd: "/workspace/offline", name: "offline-reply", status: "idle", messages: [{ id: "root", role: "assistant", text: "Waiting" }] }
+  }));
+  const key = `${agentIdentity.hostId}:${sessionId}`;
+  await waitFor(() => hub.store.getSession(key));
+  const machine = hub.virtual.offer(hub.store.getHost(agentIdentity.hostId)).machine;
+  const messageId = hub.virtual.virtualMessage(hub.store.getSession(key), hub.store.getSession(key).messages[0], 0).id;
+  agent.close();
+  await waitFor(() => hub.store.getSession(key).online === false ? true : undefined);
+  const reply = () => fetch(`http://127.0.0.1:${hub.addresses().door.port}/api/inbox/device/messages/${messageId}/reply`, {
+    method: "POST", headers: { authorization: `Bearer ${machine.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ idempotency_key: "offline-reply", words: "Deliver on reconnect", seen_through_seq: 1 })
+  });
+  const accepted = await reply();
+  assert.equal(accepted.status, 202);
+  assert.equal((await accepted.json()).outbox.key, "offline-reply");
+  assert.equal(hub.store.getSession(key).pendingReplies.length, 1);
+  assert.equal((await reply()).status, 202);
+  assert.equal(hub.store.getSession(key).pendingReplies.length, 1);
+
+  reconnected = await connectAgent(hub.addresses().agent, agentIdentity);
+  const delivered = nextMessage(reconnected, "reply");
+  const nextGeneration = randomUUID();
+  reconnected.send(JSON.stringify({
+    type: "session_upsert", sessionId, generation: nextGeneration,
+    session: { sessionId, generation: nextGeneration, cwd: "/workspace/offline", name: "offline-reply", status: "idle", messages: [{ id: "root", role: "assistant", text: "Waiting" }] }
+  }));
+  const request = await delivered;
+  assert.equal(request.text, "Deliver on reconnect");
+  reconnected.send(JSON.stringify({ type: "reply_result", requestId: request.requestId, sessionId, generation: nextGeneration, ok: true }));
+  await waitFor(() => hub.store.getSession(key).pendingReplies.length === 0 && hub.store.getSession(key).remoteReplies.length === 1 ? true : undefined);
+});
+
 test("host launches and resumes a Pi session over its existing WSS connection", async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-launch-"));
   const hub = await InboxHub.create({ dataDir: temporary, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
@@ -306,7 +359,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   }).start();
   hub.plannotator = runtime;
   const central = runtime.url.origin;
-  const agent = await connectAgent(addresses.agent, agentIdentity);
+  let agent = await connectAgent(addresses.agent, agentIdentity);
   const children = [];
   t.after(async () => {
     for (const child of children) child.terminate();
@@ -682,6 +735,8 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal((await launchStopResponse).status, 200);
   child.close();
 
+  const bystander = await connectAgent(addresses.agent, agentIdentity);
+  children.push(bystander);
   agent.close();
   await waitFor(() => hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`)?.online === false);
   const offlineReply = await fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
@@ -694,12 +749,26 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(held.key, "offline-outbox-contract");
   assert.equal(held.words, "Deliver after reconnect");
   assert.equal(held.thread, "contract-session");
-  const publicOutbox = await waitFor(async () => {
-    const model = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/outbox`)).json();
-    return model.waiting.some((entry) => entry.key === held.key) ? model : null;
+  const pending = await waitFor(() => {
+    const session = hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`);
+    return session.pendingReplies?.find((entry) => entry.requestId === held.key);
   });
-  const waiting = publicOutbox.waiting.find((entry) => entry.key === held.key);
-  assert.ok(["queued", "sending"].includes(waiting.state));
-  const dismissed = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/outbox/${held.key}/dismiss`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-  assert.equal(dismissed.status, 200);
+  assert.equal(pending.text, "Deliver after reconnect");
+  agent = await connectAgent(addresses.agent, agentIdentity);
+  const delivery = nextMessage(agent, "reply");
+  const reconnectGeneration = randomUUID();
+  agent.send(JSON.stringify({
+    type: "session_upsert", sessionId, generation: reconnectGeneration,
+    session: {
+      sessionId, generation: reconnectGeneration, cwd: "/workspace/contract", name: "contract-session", model: "test/model", status: "running",
+      messages: [{ id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] }]
+    }
+  }));
+  const request = await delivery;
+  assert.equal(request.requestId, held.key);
+  agent.send(JSON.stringify({ type: "reply_result", requestId: request.requestId, sessionId, generation: reconnectGeneration, ok: true }));
+  await waitFor(() => {
+    const session = hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`);
+    return session.pendingReplies.length === 0 && session.remoteReplies.some((entry) => entry.requestId === held.key) ? true : undefined;
+  });
 });
