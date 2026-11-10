@@ -8,6 +8,7 @@ import WebSocket from "ws";
 import { InboxHub } from "../server/index.js";
 import { agentSignaturePayload, parseMessage } from "../server/protocol.js";
 import { InboxStore } from "../server/store.js";
+import { chunkSnapshotMessages } from "../extension/history-sync.ts";
 
 function messageQueue(socket) {
   const messages = [];
@@ -246,6 +247,45 @@ test("simultaneous Pi processes on one host stay connected", async (t) => {
   const state = await (await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/state`)).json();
   assert.equal(state.hosts.find((host) => host.id === agentIdentity.hostId).online, true);
  });
+
+test("large histories synchronize without dropping the agent connection", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-"));
+  const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, host: "127.0.0.1" });
+  const agentIdentity = identity();
+  const agent = await connectAgent(hub.addresses().agent, agentIdentity);
+  t.after(async () => {
+    agent.socket.terminate();
+    await hub.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await agent.next((message) => message.type === "pairing_required");
+  await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await agent.next((message) => message.type === "paired");
+
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  const text = "x".repeat(7 * 1024 * 1024);
+  const messages = Array.from({ length: 5 }, (_, index) => ({ id: `large-${index}`, role: "assistant", text }));
+  assert.ok(Buffer.byteLength(JSON.stringify(messages)) > 32 * 1024 * 1024);
+  const chunks = chunkSnapshotMessages(messages);
+  assert.ok(chunks.length > 1);
+  for (const [index, chunk] of chunks.entries()) {
+    agent.socket.send(JSON.stringify({
+      type: index === 0 ? "session_upsert" : "session_patch", sessionId, generation,
+      session: { sessionId, generation, cwd: "/tmp/large-history", name: "large-history", status: "idle", messages: chunk }
+    }));
+  }
+
+  let session;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    session = hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`);
+    if (session?.messages.length === messages.length) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(agent.socket.readyState, WebSocket.OPEN);
+  assert.deepEqual(session.messages.map((message) => message.id), messages.map((message) => message.id));
+});
 
 test("inactive agent connections expire after missed heartbeats", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-"));
