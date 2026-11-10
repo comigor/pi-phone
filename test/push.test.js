@@ -35,7 +35,9 @@ test("virtual notification targets select the latest assistant message", () => {
     messages: [
       { id: "one", role: "assistant", text: "First" },
       { id: "two", role: "user", text: "Question" },
-      { id: "three", role: "assistant", text: "Latest" }
+      { id: "three", role: "assistant", text: "Latest" },
+      { id: "tool", role: "assistant", text: "Working", toolCalls: [{ name: "bash", arguments: {} }] },
+      { id: "result", role: "toolResult", text: "Raw output" }
     ]
   };
   const virtual = new VirtualMachines({ dataDir: "/tmp", store: { state: { sessions: [session] }, getSession: () => session } });

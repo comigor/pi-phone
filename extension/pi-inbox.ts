@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
 import { HostLauncher } from "./host-launch.js";
-import { chunkSnapshotMessages } from "./history-sync.js";
+import { chunkSnapshotMessages, snapshotMessages } from "./history-sync.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type Identity = { hostId: string; publicKey: string; privateKey: string };
@@ -37,40 +37,7 @@ function loadIdentity(): Identity {
   return identity;
 }
 
-function textContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.filter((block) => block?.type === "text").map((block) => block.text).join("\n");
-}
-
-function imageContent(content: unknown) {
-  if (!Array.isArray(content)) return [];
-  return content.filter((block) => block?.type === "image" && typeof block.data === "string").map((block) => ({
-    data: block.data,
-    mimeType: block.mimeType || "image/png"
-  }));
-}
-
 function buildSnapshot(ctx: ExtensionContext, generation: string, status: string, latestOnly = false) {
-  const branch = ctx.sessionManager.getBranch();
-  const messages = (latestOnly ? branch.slice(-1) : branch).flatMap((entry) => {
-    if (entry.type !== "message") return [];
-    const message = entry.message;
-    if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return [];
-    const content = message.content as unknown;
-    const toolCalls = Array.isArray(content)
-      ? content.filter((block) => block?.type === "toolCall").map((block) => ({ name: block.name, arguments: block.arguments }))
-      : [];
-    return [{
-      id: entry.id,
-      role: message.role,
-      text: textContent(content),
-      images: imageContent(content),
-      toolCalls,
-      stopReason: "stopReason" in message ? message.stopReason : undefined,
-      errorMessage: "errorMessage" in message ? message.errorMessage : undefined
-    }];
-  });
   return {
     sessionId: ctx.sessionManager.getSessionId(),
     generation,
@@ -79,7 +46,7 @@ function buildSnapshot(ctx: ExtensionContext, generation: string, status: string
     model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "",
     thinkingLevel: ctx.thinkingLevel,
     status,
-    messages
+    messages: snapshotMessages(ctx.sessionManager.getBranch(), latestOnly)
   };
 }
 

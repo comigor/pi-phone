@@ -176,6 +176,22 @@ test("Artifacts exposes the complete viewer attachment contract", () => {
   assert.equal(attachment.unavailable, null);
 });
 
+test("tool activity is hidden from persisted histories", () => {
+  const virtual = new VirtualMachines({ dataDir: "/tmp" });
+  const session = {
+    key: "host:session", sessionId: "session", cwd: "/workspace", name: "session", status: "idle", updatedAt: "2026-11-08T23:00:00.000Z", remoteReplies: [],
+    messages: [
+      { id: "question", role: "user", text: "Question" },
+      { id: "working", role: "assistant", text: "Working", toolCalls: [{ name: "bash", arguments: {} }] },
+      { id: "result", role: "toolResult", text: "Raw output" },
+      { id: "answer", role: "assistant", text: "Final answer", toolCalls: [] }
+    ]
+  };
+  assert.deepEqual(virtual.messagesFor(session).map((message) => message.body), ["Question", "Final answer"]);
+  assert.equal(virtual.row(session).message_count, 2);
+});
+
+
 test("offline replies are accepted and delivered on reconnect", async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-offline-reply-"));
   const hub = await InboxHub.create({ dataDir: temporary, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
