@@ -176,6 +176,113 @@ test("Artifacts exposes the complete viewer attachment contract", () => {
   assert.equal(attachment.unavailable, null);
 });
 
+test("host launches and resumes a Pi session over its existing WSS connection", async (t) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-launch-"));
+  const hub = await InboxHub.create({ dataDir: temporary, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, doorPort: 0, host: "127.0.0.1" });
+  const agentIdentity = identity();
+  const parent = await connectAgent(hub.addresses().agent, agentIdentity);
+  const children = [];
+  t.after(async () => {
+    for (const child of children) child.terminate();
+    parent.terminate();
+    await hub.close();
+    await rm(temporary, { recursive: true, force: true });
+  });
+  await nextMessage(parent, "pairing_required");
+  const paired = nextMessage(parent, "paired");
+  await fetch(`http://127.0.0.1:${hub.addresses().viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await paired;
+  parent.send(JSON.stringify({ type: "host_hello", launch: { agents: ["pi"], home: "/Users/igor" } }));
+  const parentSession = randomUUID();
+  const parentGeneration = randomUUID();
+  parent.send(JSON.stringify({
+    type: "session_upsert", sessionId: parentSession, generation: parentGeneration,
+    session: { sessionId: parentSession, generation: parentGeneration, cwd: "/Users/igor/Projects/pi-phone", name: "pi-phone", status: "idle", messages: [{ id: "parent-message", role: "assistant", text: "Ready" }] }
+  }));
+  await waitFor(() => hub.store.getSession(`${agentIdentity.hostId}:${parentSession}`));
+  const machine = hub.virtual.offer(hub.store.getHost(agentIdentity.hostId)).machine;
+  const door = `http://127.0.0.1:${hub.addresses().door.port}/api/inbox/device`;
+  const doorRequest = (route, init = {}) => fetch(`${door}${route}`, {
+    ...init,
+    headers: { authorization: `Bearer ${machine.token}`, "content-type": "application/json", "x-plannotator-window": "1", ...(init.headers || {}) }
+  });
+  const health = await waitFor(async () => {
+    const response = await doorRequest("/health");
+    const body = await response.json();
+    return body.launch_from_machines === 1 ? body : null;
+  });
+  assert.equal(health.machine_links, 1);
+  const discovery = await (await doorRequest("/sessions")).json();
+  assert.deepEqual(discovery.launch.agents.map((agent) => agent.agent), ["pi"]);
+  const project = discovery.launch.projects.find((item) => item.root === "/Users/igor/Projects/pi-phone");
+  assert.ok(project);
+
+  const refused = await doorRequest("/messages", {
+    method: "POST", headers: { "x-plannotator-window": "0" },
+    body: JSON.stringify({ idempotency_key: "not-a-window", body: "No launch", to: { launch: { agent: "pi", project_id: project.id } } })
+  });
+  assert.equal(refused.status, 403);
+
+  const startMessage = nextMessage(parent, "launch_start");
+  const launchResponsePromise = doorRequest("/messages", {
+    method: "POST",
+    body: JSON.stringify({ idempotency_key: "launch-contract", body: "Investigate the relay", thread_name: "Relay investigation", to: { launch: { agent: "pi", project_id: project.id } } })
+  });
+  const start = await startMessage;
+  assert.equal(start.cwd, "/Users/igor/Projects/pi-phone");
+  assert.equal(start.name, "Relay investigation");
+  parent.send(JSON.stringify({ type: "launch_result", requestId: start.requestId, launchId: start.launchId, ok: true }));
+  const child = await connectAgent(hub.addresses().agent, agentIdentity);
+  children.push(child);
+  const firstDelivery = nextMessage(child, "reply");
+  const childGeneration = randomUUID();
+  child.send(JSON.stringify({
+    type: "session_upsert", sessionId: start.sessionId, generation: childGeneration,
+    session: { sessionId: start.sessionId, generation: childGeneration, cwd: start.cwd, name: start.name, status: "idle", messages: [] }
+  }));
+  const delivered = await firstDelivery;
+  assert.equal(delivered.text, "Investigate the relay");
+  child.send(JSON.stringify({ type: "reply_result", requestId: delivered.requestId, sessionId: start.sessionId, generation: childGeneration, ok: true }));
+  const launchResponse = await launchResponsePromise;
+  const launchBody = await launchResponse.text();
+  assert.equal(launchResponse.status, 200, launchBody);
+  const launched = JSON.parse(launchBody);
+  assert.equal(launched.launch.state, "starting");
+  assert.equal(launched.message.body, "Investigate the relay");
+  assert.equal(launched.message.launch.agent, "pi");
+  assert.equal(launched.message.launch.session_ref, start.sessionId);
+
+  const stopMessage = nextMessage(parent, "launch_stop");
+  const stopResponsePromise = doorRequest(`/launch/${launched.launch.id}/stop`, { method: "POST", body: "{}" });
+  const stop = await stopMessage;
+  assert.equal(stop.sessionId, start.sessionId);
+  parent.send(JSON.stringify({ type: "launch_result", requestId: stop.requestId, launchId: stop.launchId, ok: true }));
+  assert.equal((await stopResponsePromise).status, 200);
+  child.terminate();
+  await waitFor(() => hub.store.getSession(`${agentIdentity.hostId}:${start.sessionId}`)?.online === false);
+
+  const resumeMessage = nextMessage(parent, "launch_start");
+  const resumeResponsePromise = doorRequest(`/messages/${launched.message.id}/reply`, {
+    method: "POST", body: JSON.stringify({ idempotency_key: "resume-contract", words: "Continue after stop" })
+  });
+  const resumed = await resumeMessage;
+  assert.equal(resumed.sessionId, start.sessionId);
+  parent.send(JSON.stringify({ type: "launch_result", requestId: resumed.requestId, launchId: resumed.launchId, ok: true }));
+  const resumedChild = await connectAgent(hub.addresses().agent, agentIdentity);
+  children.push(resumedChild);
+  const resumedDelivery = nextMessage(resumedChild, "reply");
+  const resumedGeneration = randomUUID();
+  resumedChild.send(JSON.stringify({
+    type: "session_upsert", sessionId: start.sessionId, generation: resumedGeneration,
+    session: { sessionId: start.sessionId, generation: resumedGeneration, cwd: start.cwd, name: start.name, status: "idle", messages: [] }
+  }));
+  const continued = await resumedDelivery;
+  assert.equal(continued.text, "Continue after stop");
+  resumedChild.send(JSON.stringify({ type: "reply_result", requestId: continued.requestId, sessionId: start.sessionId, generation: resumedGeneration, ok: true }));
+  assert.equal((await resumeResponsePromise).status, 200);
+});
+
 test("an unchanged Plannotator links to a virtual Pi host and controls its session", { skip: !available, timeout: 60_000 }, async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-virtual-"));
   const agentIdentity = identity();
@@ -199,7 +306,9 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   hub.plannotator = runtime;
   const central = runtime.url.origin;
   const agent = await connectAgent(addresses.agent, agentIdentity);
+  const children = [];
   t.after(async () => {
+    for (const child of children) child.terminate();
     agent.terminate();
     await hub.close();
     await runtime.stop();
@@ -207,6 +316,8 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   });
 
   await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  agent.send(JSON.stringify({ type: "host_hello", launch: { agents: ["pi"], home: "/Users/igor" } }));
+  await waitFor(() => hub.store.getHost(agentIdentity.hostId)?.launch);
   const sessionId = randomUUID();
   const generation = randomUUID();
   agent.send(JSON.stringify({
@@ -524,6 +635,51 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const worker = await fetch(`http://127.0.0.1:${addresses.viewer.port}/sw.js`);
   assert.equal(worker.status, 200);
   assert.match(await worker.text(), /notificationclick/);
+
+  const launchDiscovery = await waitFor(async () => {
+    const model = await (await fetch(`${forwardedBase}/sessions`)).json();
+    return model.launch?.agents.some((entry) => entry.agent === "pi") ? model : null;
+  });
+  assert.equal(launchDiscovery.launch.projects[0].id, listed.project_id);
+  const launchRequest = nextMessage(agent, "launch_start");
+  const launchResponsePromise = fetch(`${forwardedBase}/messages`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central, "x-plannotator-window": "1" },
+    body: JSON.stringify({
+      serverSession: centralHealth.serverSession, idempotency_key: "upstream-launch-contract", body: "Launch from central Plannotator",
+      to: { launch: { agent: "pi", project_id: listed.project_id } }, thread_name: "Central launch"
+    })
+  });
+  const launchStart = await launchRequest;
+  agent.send(JSON.stringify({ type: "launch_result", requestId: launchStart.requestId, launchId: launchStart.launchId, sessionId: launchStart.sessionId, ok: true }));
+  const child = await connectAgent(addresses.agent, agentIdentity);
+  children.push(child);
+  const childGeneration = randomUUID();
+  const launchDelivery = nextMessage(child, "reply");
+  child.send(JSON.stringify({
+    type: "session_upsert", sessionId: launchStart.sessionId, generation: childGeneration,
+    session: { sessionId: launchStart.sessionId, generation: childGeneration, cwd: "/workspace/contract", name: "Central launch", model: "test/model", status: "idle", messages: [] }
+  }));
+  const launchedPrompt = await launchDelivery;
+  child.send(JSON.stringify({ type: "reply_result", requestId: launchedPrompt.requestId, sessionId: launchStart.sessionId, generation: childGeneration, ok: true }));
+  const launchResponse = await launchResponsePromise;
+  assert.equal(launchResponse.status, 200);
+  const launched = await launchResponse.json();
+  assert.equal(launched.launch.state, "starting");
+  const launchedThread = await (await fetch(`${forwardedBase}/threads/${launched.thread_id}`)).json();
+  assert.equal(launchedThread.thread.messages[0].launch.id, launched.launch.id);
+  const launchStopRequest = nextMessage(agent, "launch_stop");
+  const launchStopResponse = fetch(`${forwardedBase}/launch/${launched.launch.id}/stop`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central }, body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "upstream-stop-contract" })
+  });
+  const stopOutcome = await Promise.race([
+    launchStopRequest.then((request) => ({ request })),
+    launchStopResponse.then(async (response) => ({ response, body: await response.text() }))
+  ]);
+  if (stopOutcome.response) assert.fail(`Central Stop failed before forwarding: ${stopOutcome.response.status} ${stopOutcome.body}`);
+  const launchStop = stopOutcome.request;
+  agent.send(JSON.stringify({ type: "launch_result", requestId: launchStop.requestId, launchId: launchStop.launchId, sessionId: launchStop.sessionId, ok: true }));
+  assert.equal((await launchStopResponse).status, 200);
+  child.close();
 
   agent.close();
   await waitFor(() => hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`)?.online === false);

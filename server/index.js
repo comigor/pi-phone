@@ -11,6 +11,7 @@ import { VirtualMachines } from "./virtual-machines.js";
 import { PlannotatorRuntime } from "./plannotator.js";
 import { DraftStore } from "./drafts.js";
 import { mergeSearchAnswers } from "./search.js";
+import { HostLaunchCoordinator } from "./host-launch.js";
 
 const PUBLIC_FILES = new Map([
   ["/legacy", "index.html"],
@@ -71,6 +72,7 @@ export class InboxHub {
     this.viewers = new Set();
     this.challenges = new Map();
     this.pendingReplies = new Map();
+    this.launch = new HostLaunchCoordinator({ store: this.store, agents: this.agents, sessionAgents: this.sessionAgents });
     this.agentWss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
     this.viewerWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     this.agentHttp = createServer((request, response) => this.handleAgentHttp(request, response));
@@ -97,7 +99,9 @@ export class InboxHub {
       publicAddress: options.virtualAddress,
       linkMachine: options.linkMachine,
       deliverReply: (input) => hub.deliverReply(input),
-      stopSession: (input) => hub.stopSession(input)
+      stopSession: (input) => hub.stopSession(input),
+      startLaunch: (input) => hub.launch.start(input),
+      stopLaunch: (session) => hub.launch.stop(session)
     });
     await hub.virtual.load();
     push.targetFor = (item) => hub.virtual.notificationTarget(item);
@@ -233,17 +237,20 @@ export class InboxHub {
 
   async handleAgentMessage(host, socket, message) {
     if (message.type === "ping") return socketSend(socket, { type: "pong" });
+    if (message.type === "host_hello") return this.launch.hello(host, message);
+    if (message.type === "launch_result") return this.launch.result(message);
     const sessionId = requireString(message.sessionId, "sessionId", 300);
     const generation = requireString(message.generation, "generation", 100);
     const key = `${host.id}:${sessionId}`;
     if (message.type === "session_upsert" || message.type === "session_patch") {
       requireString(message.session?.generation, "generation", 100);
       if (message.session.generation !== generation || message.session.sessionId !== sessionId) throw new Error("Session identity mismatch");
-      if (message.type === "session_upsert" && !this.store.getSession(key) && !message.session.messages?.length) return;
+      if (message.type === "session_upsert" && !this.store.getSession(key) && !message.session.messages?.length && !this.launch.hasPending(host.id, sessionId)) return;
       const session = message.type === "session_patch" ? await this.store.patchSession(host.id, message.session) : await this.store.upsertSession(host.id, message.session);
       if (!session) return socketSend(socket, { type: "session_snapshot_required", sessionId, generation });
       await this.virtual.ensureLinked(host);
       this.sessionAgents.set(key, { socket, generation });
+      await this.launch.onSessionUpsert(session);
       if (session.status === "running") {
         await this.store.resolveSessionInbox(key);
         this.broadcastState();
@@ -368,8 +375,9 @@ export class InboxHub {
     });
   }
 
-  deliverReply({ key, generation, requestId, text, attachments = [] }) {
+  async deliverReply({ key, generation, requestId, text, attachments = [] }) {
     requireString(text, "text", 32_000);
+    await this.launch.ensureOnline(this.store.getSession(key));
     const current = this.store.getSession(key);
     const effectiveGeneration = current?.online ? current.generation : generation;
     const { session } = this.agentRoute(key, effectiveGeneration);

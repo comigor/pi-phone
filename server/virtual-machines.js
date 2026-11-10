@@ -136,6 +136,8 @@ export class VirtualMachines {
     this.store = options.store;
     this.deliverReply = options.deliverReply;
     this.stopSession = options.stopSession;
+    this.startLaunch = options.startLaunch;
+    this.stopLaunch = options.stopLaunch;
     this.linkMachine = options.linkMachine;
     this.publicAddress = options.publicAddress;
     this.file = path.join(options.dataDir, "virtual-machines.json");
@@ -320,6 +322,7 @@ export class VirtualMachines {
       base_path: session.cwd,
       seq: index + 1,
       ...(index === 0 ? { person_seen_seq: session.seenThroughSeq ?? null } : {}),
+      ...(index === 0 && session.launch ? { launch: session.launch } : {}),
       ack: session.acks?.[mid] || null,
       ...(attachments.length ? { attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })) } : {})
     };
@@ -430,6 +433,24 @@ export class VirtualMachines {
     };
   }
 
+  run(session) {
+    if (!session.launch) return null;
+    const stopped = Boolean(session.launchStoppedAt) || !session.online;
+    return {
+      state: stopped ? "stopped" : session.status === "running" ? "working" : "waiting_answer",
+      launch_id: session.launch.id,
+      agent: "pi",
+      project: projectFor(session).name,
+      folder: session.launch.folder,
+      since: session.launchStoppedAt || session.updatedAt,
+      again: false,
+      stopped_by_person: Boolean(session.launchStoppedAt),
+      cause: null,
+      untrusted: false,
+      attach_command: null
+    };
+  }
+
   thread(session) {
     const project = projectFor(session);
     return {
@@ -444,7 +465,8 @@ export class VirtualMachines {
         messages: this.messagesFor(session),
         archive_seq: null
       },
-      row: this.row(session)
+      row: this.row(session),
+      run: this.run(session)
     };
   }
 
@@ -567,13 +589,24 @@ export class VirtualMachines {
     };
   }
 
+  launchProjects(machine) {
+    return [...new Map(this.sessions(machine).map((session) => {
+      const project = projectFor(session);
+      return [project.root, { id: project.id, name: project.name, root: project.root, exists: true }];
+    })).values()];
+  }
+
   sessionList(machine, threadId) {
     const sessions = this.sessions(machine).filter((session) => session.online && (!threadId || session.key === threadId));
     const projects = [...new Map(sessions.map((session) => {
       const project = projectFor(session);
       return [project.id, { project, sessions: [this.liveSession(session)] }];
     })).values()];
-    return { serverSession: id("srv", machine.hostId), machine: machine.inboxId, home: "/", projects };
+    const host = this.store.getHost(machine.hostId);
+    const launch = host?.online && host.launch ? {
+      agents: [{ agent: "pi", name: "Pi" }], projects: this.launchProjects(machine), not_ready: []
+    } : undefined;
+    return { serverSession: id("srv", machine.hostId), machine: machine.inboxId, home: host?.launch?.home || "/", projects, ...(launch ? { launch } : {}) };
   }
 
   findByMessage(machine, messageIdValue) {
@@ -751,6 +784,31 @@ export class VirtualMachines {
   }
 
 
+  async launchMessage(machine, body, request, response) {
+    if (request.headers["x-plannotator-window"] !== "1") return send(response, 403, { code: "window_only", error: "Launching an agent requires the Inbox window" });
+    const to = body.to?.launch;
+    if (!to || to.agent !== "pi" || typeof to.project_id !== "string" || typeof body.body !== "string" || !body.body.trim()) {
+      return send(response, 422, { code: "validation_error", error: "Launch needs a Pi agent, an existing project, and a message" });
+    }
+    if (Array.isArray(body.uploads) && body.uploads.length) return send(response, 422, { code: "validation_error", error: "Attachments are not supported when launching" });
+    const project = this.launchProjects(machine).find((candidate) => candidate.id === to.project_id);
+    if (!project) return send(response, 422, { code: "project_not_found", error: "Project is not available on this host" });
+    const started = await this.startLaunch({ machine, project, body });
+    const { session, launch } = started;
+    const key = requireKey(body.idempotency_key);
+    let previous = (session.remoteReplies || []).find((message) => message.requestId === key);
+    if (!previous) {
+      await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text: body.body.trim(), attachments: [] });
+      previous = (await this.store.appendRemoteReply(session.key, { requestId: key, text: body.body.trim(), attachments: [] })).message;
+    }
+    await this.changed(session);
+    const reply = this.virtualMessage(session, previous, 0);
+    return send(response, 200, {
+      thread_id: id("msg", session.key), message: reply, project: projectFor(session), replayed: started.replayed,
+      launch: { id: launch.id, state: "starting" }
+    }, started.replayed ? { "idempotent-replayed": "true" } : {});
+  }
+
   async reply(_machine, session, body, _request, response, compose = false) {
     const key = requireKey(body.idempotency_key);
     const words = compose ? body.body : body.words;
@@ -785,8 +843,9 @@ export class VirtualMachines {
     const machine = this.authenticated(request);
     if (!machine) return send(response, 401, { code: "device_token_invalid", error: "Unknown machine token" });
     if (route === "health") {
-      if (!this.store.getHost(machine.hostId)?.online) return send(response, 503, { code: "machine_offline", error: "Host is offline" });
-      return send(response, 200, { ok: true, inbox_id: machine.inboxId, machine_links: 1, version: "0.28.48", launch_from_machines: 0 });
+      const host = this.store.getHost(machine.hostId);
+      if (!host?.online) return send(response, 503, { code: "machine_offline", error: "Host is offline" });
+      return send(response, 200, { ok: true, inbox_id: machine.inboxId, machine_links: 1, version: "0.28.60", launch_from_machines: host.launch ? 1 : 0 });
     }
     if (route === "events") return this.events(machine, request, response);
     if (route === "threads" && request.method === "GET") return send(response, 200, this.list(machine));
@@ -798,6 +857,7 @@ export class VirtualMachines {
     if (route === "skills/content" && request.method === "GET") return send(response, 200, { content: "" });
     if (route === "messages" && request.method === "POST") {
       const body = await bodyJson(request);
+      if (body.to?.launch) return this.launchMessage(machine, body, request, response);
       const session = this.sessions(machine).find((item) => item.sessionId === body.to?.session && item.online);
       if (!session) return send(response, 409, { code: "session_not_live", error: "Session is not live" });
       return this.reply(machine, session, body, request, response, true);
@@ -905,6 +965,15 @@ export class VirtualMachines {
       });
       await this.changed(session);
       return send(response, 200, { thread: this.row(session) });
+    }
+    match = route.match(new RegExp("^launch/([^/]+)/stop$"));
+    if (match && request.method === "POST") {
+      if (request.headers["x-plannotator-window"] !== "1") return send(response, 403, { code: "window_only", error: "Stopping an agent requires the Inbox window" });
+      const session = this.sessions(machine).find((item) => item.launch?.id === match[1]);
+      if (!session) return send(response, 404, { code: "launch_not_found" });
+      await this.stopLaunch(session);
+      await this.changed(session);
+      return send(response, 200, { run: this.run(session) });
     }
     match = route.match(new RegExp("^messages/([^/]+)/reply$"));
     if (match && request.method === "POST") {

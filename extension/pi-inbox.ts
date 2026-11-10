@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
+import { HostLauncher } from "./host-launch.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type Identity = { hostId: string; publicKey: string; privateKey: string };
@@ -95,6 +96,8 @@ class PiInboxRuntime {
   private pairingCode?: string;
   private latestSnapshot: Snapshot;
   private replyResults = new Map<string, { ok: boolean; error?: string }>();
+  private launcher = new HostLauncher();
+  private launchTasks = new Set<Promise<void>>();
 
   constructor(private pi: ExtensionAPI, private ctx: ExtensionContext) {
     this.latestSnapshot = buildSnapshot(ctx, this.generation, ctx.isIdle() ? "idle" : "running");
@@ -183,6 +186,10 @@ class PiInboxRuntime {
       return;
     }
     if (!message || typeof message.type !== "string") return;
+    if (message.type === "launch_start" || message.type === "launch_stop") {
+      this.handleLaunch(message);
+      return;
+    }
     if (message.type === "pairing_required") {
       this.canSend = false;
       if (this.pairingCode !== message.pairingCode) {
@@ -194,6 +201,7 @@ class PiInboxRuntime {
     }
     if (message.type === "paired") {
       this.canSend = true;
+      this.send({ type: "host_hello", launch: { agents: ["pi"], home: os.homedir() } });
       this.pairingCode = undefined;
       this.setStatus(undefined);
       this.snapshot(this.latestSnapshot.status, true);
@@ -250,6 +258,20 @@ class PiInboxRuntime {
     } catch (error) {
       this.completeReply(message.requestId, { ok: false, error: error instanceof Error ? error.message : "Reply failed" });
     }
+  }
+
+  private handleLaunch(message: { type: string; requestId: string; launchId: string; sessionId: string; cwd?: string; name?: string }) {
+    const task = (async () => {
+      try {
+        if (message.type === "launch_start") await this.launcher.start(message.sessionId, message.cwd || os.homedir(), message.name || "Pi session");
+        else await this.launcher.stop(message.sessionId);
+        this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: true });
+      } catch (error) {
+        this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: false, error: error instanceof Error ? error.message : "Launch failed" });
+      }
+    })();
+    this.launchTasks.add(task);
+    void task.finally(() => this.launchTasks.delete(task));
   }
 
   private completeReply(requestId: string, result: { ok: boolean; error?: string }) {

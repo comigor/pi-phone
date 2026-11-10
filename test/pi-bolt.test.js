@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,32 +11,42 @@ const executable = process.env.PI_INBOX_TEST_PI_BOLT;
 async function waitFor(check, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const value = await check();
-    if (value) return value;
+    try {
+      const value = await check();
+      if (value) return value;
+    } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("Timed out waiting for condition");
 }
 
-test("Pi-Bolt loads the extension and registers a real session", { skip: !executable, timeout: 30000 }, async (t) => {
+test("Pi-Bolt launches and stops a real session through the extension", { skip: !executable, timeout: 45000 }, async (t) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-bolt-"));
   const hub = await InboxHub.create({ dataDir: path.join(temporary, "data"), publicDir: path.resolve("public"), publicUrl: "http://localhost" });
-  await hub.listen({ viewerPort: 0, agentPort: 0, host: "127.0.0.1" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, doorPort: 0, host: "127.0.0.1" });
   const addresses = hub.addresses();
   const viewerBase = `http://127.0.0.1:${addresses.viewer.port}`;
-  const child = spawn(executable, ["--mode", "rpc", "--no-session", "-e", path.resolve("extension/pi-inbox.ts")], {
+  const doorBase = `http://127.0.0.1:${addresses.door.port}/api/inbox/device`;
+  const wrapper = path.join(temporary, "pi-bolt-local");
+  await writeFile(wrapper, `#!/bin/sh\nexec "${executable}" --no-extensions --no-mcp -e "${path.resolve("extension/pi-inbox.ts")}" "$@"\n`);
+  await chmod(wrapper, 0o700);
+  const child = spawn(executable, ["--mode", "rpc", "--no-session", "--no-extensions", "--no-mcp", "-e", path.resolve("extension/pi-inbox.ts")], {
     cwd: temporary,
     env: {
       ...process.env,
       PI_CODING_AGENT_DIR: path.join(temporary, "agent"),
       PI_INBOX_STATE_DIR: path.join(temporary, "identity"),
-      PI_INBOX_RELAY_URL: `ws://127.0.0.1:${addresses.agent.port}`
+      PI_INBOX_RELAY_URL: `ws://127.0.0.1:${addresses.agent.port}`,
+      PI_INBOX_LAUNCH_COMMAND: wrapper
     },
     stdio: ["pipe", "pipe", "pipe"]
   });
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   t.after(async () => {
+    for (const session of hub.store.state.sessions.filter((item) => item.launch && !item.launchStoppedAt)) {
+      await hub.launch.stop(session).catch(() => undefined);
+    }
     child.stdin.end();
     if (child.exitCode === null) child.kill("SIGTERM");
     await hub.close();
@@ -49,26 +59,55 @@ test("Pi-Bolt loads the extension and registers a real session", { skip: !execut
   });
   const host = state.hosts[0];
   assert.equal(host.paired, false);
-  const approval = await fetch(`${viewerBase}/api/hosts/${host.id}/approve`, { method: "POST" });
-  assert.equal(approval.status, 200);
+  assert.equal((await fetch(`${viewerBase}/api/hosts/${host.id}/approve`, { method: "POST" })).status, 200);
+  await waitFor(() => hub.store.getHost(host.id)?.launch?.agents.includes("pi") ? true : undefined);
 
-  const live = await waitFor(async () => {
-    const current = await (await fetch(`${viewerBase}/api/state`)).json();
-    return current.sessions.find((session) => session.hostId === host.id && session.online);
+  await hub.store.upsertSession(host.id, {
+    sessionId: "launch-project", generation: "launch-project", cwd: temporary, name: "launch-project", model: "test/model", status: "idle",
+    messages: [{ id: "project-message", role: "assistant", text: "Existing project" }]
   });
-  await waitFor(() => hub.sessionAgents.get(live.key)?.generation === live.generation ? true : undefined);
-  const reply = { key: live.key, generation: live.generation, requestId: "pi-bolt-dedupe", text: "Deliver once" };
-  await hub.deliverReply(reply);
-  const afterFirst = await waitFor(async () => {
-    const current = await (await fetch(`${viewerBase}/api/state`)).json();
-    const session = current.sessions.find((item) => item.key === live.key);
-    return session.messageCount > live.messageCount ? session : undefined;
+  const { machine } = hub.virtual.offer(hub.store.getHost(host.id));
+  machine.linkedAt = new Date().toISOString();
+  await hub.virtual.persist();
+  const headers = { authorization: `Bearer ${machine.token}`, "content-type": "application/json" };
+  const discovery = await (await fetch(`${doorBase}/sessions`, { headers })).json();
+  const project = discovery.launch.projects.find((item) => item.root === temporary);
+  assert.ok(project);
+
+  const body = {
+    idempotency_key: "real-pi-bolt-launch", body: "Reply with a short launch confirmation",
+    to: { launch: { agent: "pi", project_id: project.id } }, thread_name: "Real Pi-Bolt launch"
+  };
+  const launchResponse = await fetch(`${doorBase}/messages`, { method: "POST", headers: { ...headers, "x-plannotator-window": "1" }, body: JSON.stringify(body) }).catch((error) => {
+    throw new Error(`${error.message}; parent stderr=${stderr}`);
   });
-  await hub.deliverReply(reply);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  const afterSecond = await (await fetch(`${viewerBase}/api/state`)).json();
-  assert.equal(afterSecond.sessions.find((item) => item.key === live.key).messageCount, afterFirst.messageCount);
-  child.stdin.end();
-  await new Promise((resolve) => child.once("exit", resolve));
-  assert.equal(child.exitCode, 0, stderr);
+  const launchPayload = await launchResponse.text();
+  assert.equal(launchResponse.status, 200, launchPayload);
+  const launched = JSON.parse(launchPayload);
+  const launchedSession = await waitFor(() => hub.store.state.sessions.find((session) => session.launch?.id === launched.launch.id && session.online));
+  assert.equal(await realpath(launchedSession.cwd), await realpath(temporary));
+  const thread = await (await fetch(`${doorBase}/threads/${launched.thread_id}`, { headers })).json();
+  assert.equal(thread.thread.messages[0].body, body.body);
+  assert.equal(thread.thread.messages[0].launch.id, launched.launch.id);
+
+  const replay = await fetch(`${doorBase}/messages`, { method: "POST", headers: { ...headers, "x-plannotator-window": "1" }, body: JSON.stringify(body) });
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).replayed, true);
+
+  const stop = await fetch(`${doorBase}/launch/${launched.launch.id}/stop`, { method: "POST", headers: { ...headers, "x-plannotator-window": "1" }, body: "{}" });
+  const stopPayload = await stop.text();
+  assert.equal(stop.status, 200, stopPayload);
+  assert.equal(JSON.parse(stopPayload).run.state, "stopped");
+  await waitFor(() => hub.store.getSession(launchedSession.key)?.online === false ? true : undefined);
+
+  const resume = await fetch(`${doorBase}/messages/${thread.thread.messages[0].id}/reply`, {
+    method: "POST", headers,
+    body: JSON.stringify({ idempotency_key: "real-pi-bolt-resume", words: "Continue after restart", seen_through_seq: thread.cursor })
+  });
+  const resumePayload = await resume.text();
+  assert.equal(resume.status, 200, resumePayload);
+  await waitFor(() => hub.store.getSession(launchedSession.key)?.online && !hub.store.getSession(launchedSession.key)?.launchStoppedAt ? true : undefined);
+
+  const finalStop = await fetch(`${doorBase}/launch/${launched.launch.id}/stop`, { method: "POST", headers: { ...headers, "x-plannotator-window": "1" }, body: "{}" });
+  assert.equal(finalStop.status, 200);
 });
