@@ -20,8 +20,14 @@ function id(prefix, ...parts) {
   return result;
 }
 
+function isVisibleMessage(message) {
+  if (message.role === "user") return true;
+  if (message.role !== "assistant" || message.stopReason === "toolUse" || message.toolCalls?.length) return false;
+  return Boolean(message.text || message.errorMessage || message.images?.length || message.attachments?.length);
+}
+
 function hasThreadContent(session) {
-  return Boolean(session.messages?.length || session.remoteReplies?.length);
+  return Boolean(session.messages?.some(isVisibleMessage) || session.remoteReplies?.length);
 }
 function send(response, status, body, headers = {}) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers });
@@ -275,9 +281,10 @@ export class VirtualMachines {
     const session = this.store.getSession(item.sessionKey);
     const machine = this.machines.get(item.hostId);
     if (!session || !machine) return null;
+    const messages = this.sourceMessagesFor(session);
     let assistantIndex = -1;
-    for (let index = session.messages.length - 1; index >= 0; index--) {
-      if (session.messages[index].role === "assistant") {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index].role === "assistant") {
         assistantIndex = index;
         break;
       }
@@ -285,7 +292,7 @@ export class VirtualMachines {
     return {
       machine: machine.inboxId,
       thread: id("msg", session.key),
-      message: assistantIndex >= 0 ? messageId(session, session.messages[assistantIndex], assistantIndex) : null
+      message: assistantIndex >= 0 ? messageId(session, messages[assistantIndex], assistantIndex) : null
     };
   }
 
@@ -361,7 +368,7 @@ export class VirtualMachines {
 
   sourceMessagesFor(session) {
     const unmatchedReplies = [...(session.remoteReplies || [])];
-    const messages = session.messages.map((message) => {
+    const messages = session.messages.filter(isVisibleMessage).map((message) => {
       const index = unmatchedReplies.findIndex((reply) => matchesPersistedReply(message, reply));
       return index >= 0 ? unmatchedReplies.splice(index, 1)[0] : message;
     });
