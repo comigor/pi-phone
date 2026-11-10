@@ -194,7 +194,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     binary,
     dataDir: path.join(temporary, "central"),
     virtualAddress,
-    env: { PLANNOTATOR_TEST_SANDBOX: "1" }
+    env: { PLANNOTATOR_TEST_SANDBOX: "1", HOME: temporary }
   }).start();
   hub.plannotator = runtime;
   const central = runtime.url.origin;
@@ -326,13 +326,14 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.ok(!(await pin(false)).pins.some((thread) => thread.thread_id === listed.thread_id));
 
   const until = new Date(Date.now() + 60 * 60_000).toISOString();
-  const snooze = async (value) => {
+  const snooze = async (value, expectedStatus = 200) => {
     const response = await fetch(`${forwardedBase}/threads/${listed.thread_id}/snooze`, {
       method: "POST", headers: { "content-type": "application/json", origin: central },
       body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: randomUUID(), until: value })
     });
-    assert.equal(response.status, 200);
-    return response.json();
+    const payload = await response.text();
+    assert.equal(response.status, expectedStatus, payload);
+    return JSON.parse(payload);
   };
   assert.equal((await snooze(until)).snoozed.until, until);
   const snoozedList = await waitFor(async () => {
@@ -342,7 +343,11 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.ok(snoozedList.sections.flatMap((section) => section.threads).every((thread) => thread.thread_id !== listed.thread_id));
   assert.equal((await snooze(null)).snoozed, null);
   const expired = new Date(Date.now() - 60_000).toISOString();
-  await snooze(expired);
+  const expiredStatus = centralHealth.version === "0.28.48" ? 200 : 409;
+  const expiredAnswer = await snooze(expired, expiredStatus);
+  if (expiredStatus === 409) assert.equal(expiredAnswer.code, "snooze_past");
+  else assert.equal(expiredAnswer.snoozed.until, expired);
+  await hub.store.updateVirtualSession(`${agentIdentity.hostId}:${sessionId}`, { snoozedUntil: expired, snoozedAt: new Date().toISOString() });
   const expiredList = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads?archived=exclude&snoozed=exclude&machines=1`)).json();
   assert.ok(expiredList.snoozed.every((thread) => thread.thread_id !== listed.thread_id));
   assert.ok(expiredList.sections.flatMap((section) => section.threads).some((thread) => thread.thread_id === listed.thread_id));

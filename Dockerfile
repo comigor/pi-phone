@@ -1,8 +1,8 @@
 FROM node:22-bookworm-slim AS plannotator
-ARG PLANNOTATOR_VERSION=0.28.48
+ARG PLANNOTATOR_VERSION=0.28.60
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
     curl -fsSL -o /usr/local/bin/plannotator "https://github.com/backnotprop/plannotator/releases/download/v${PLANNOTATOR_VERSION}/plannotator-linux-x64" && \
-    echo "fa0a41e8e0a069af84dfd081ca0689b42842e55e2a72488030140f29a55a1db0  /usr/local/bin/plannotator" | sha256sum -c - && \
+    echo "1ded21e09a51516f86e018687ae2527839f376ecfe6eb6002479590c97d1e003  /usr/local/bin/plannotator" | sha256sum -c - && \
     chmod +x /usr/local/bin/plannotator && \
     /usr/local/bin/plannotator --version
 
