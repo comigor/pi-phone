@@ -10,7 +10,7 @@ FROM node:22-bookworm-slim
 ENV NODE_ENV=production GH_CONFIG_DIR=/data/gh
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends gh socat && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gh socat && rm -rf /var/lib/apt/lists/*
 
 COPY --from=plannotator /usr/local/bin/plannotator /usr/local/bin/plannotator
 COPY package.json package-lock.json ./
