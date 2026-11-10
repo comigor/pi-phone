@@ -181,8 +181,9 @@ test("host launches and resumes a Pi session over its existing WSS connection", 
   const hub = await InboxHub.create({ dataDir: temporary, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
   await hub.listen({ viewerPort: 0, agentPort: 0, doorPort: 0, host: "127.0.0.1" });
   const agentIdentity = identity();
+  const bystander = await connectAgent(hub.addresses().agent, agentIdentity);
   const parent = await connectAgent(hub.addresses().agent, agentIdentity);
-  const children = [];
+  const children = [bystander];
   t.after(async () => {
     for (const child of children) child.terminate();
     parent.terminate();

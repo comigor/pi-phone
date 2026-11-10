@@ -17,12 +17,24 @@ export class HostLaunchCoordinator {
     this.requests = new Map();
     this.idempotency = new Map();
     this.waiters = new Map();
+    this.capable = new WeakSet();
   }
 
-  async hello(host, message) {
+  async hello(host, message, socket) {
     const agents = Array.isArray(message.launch?.agents) ? message.launch.agents.filter((agent) => agent === "pi") : [];
+    if (agents.length) this.capable.add(socket);
+    else this.capable.delete(socket);
     host.launch = agents.length ? { agents, home: typeof message.launch.home === "string" ? message.launch.home : "/" } : null;
     await this.store.persist();
+  }
+
+  async closed(host, socket) {
+    if (!this.capable.has(socket)) return;
+    const capable = [...(this.agents.get(host.id) || [])].some((candidate) => this.capable.has(candidate) && candidate.readyState === WebSocket.OPEN);
+    if (!capable && host.launch) {
+      host.launch = null;
+      await this.store.persist();
+    }
   }
 
   result(message) {
@@ -54,7 +66,7 @@ export class HostLaunchCoordinator {
   }
 
   requestHost(hostId, message) {
-    const socket = [...(this.agents.get(hostId) || [])].find((candidate) => candidate.readyState === WebSocket.OPEN);
+    const socket = [...(this.agents.get(hostId) || [])].find((candidate) => this.capable.has(candidate) && candidate.readyState === WebSocket.OPEN);
     if (!socket) return Promise.reject(new Error("Host is offline"));
     const waiter = deferred();
     const timeout = setTimeout(() => {
@@ -75,6 +87,7 @@ export class HostLaunchCoordinator {
     this.waiters.set(key, waiters);
     record.timeout = setTimeout(() => {
       waiters.delete(record);
+      if (!waiters.size) this.waiters.delete(key);
       waiter.reject(new Error("Launched session did not connect"));
     }, 15_000);
     record.timeout.unref();
@@ -111,13 +124,13 @@ export class HostLaunchCoordinator {
     const pending = { hostId, sessionId, launch, cwd: project.root, name: body.thread_name || project.name };
     this.pending.set(launch.id, pending);
     const registered = this.waitForSession(`${hostId}:${sessionId}`);
+    registered.catch(() => undefined);
     try {
       await this.requestHost(hostId, { type: "launch_start", requestId: randomUUID(), launchId: launch.id, sessionId, cwd: pending.cwd, name: pending.name });
       const session = await registered;
       return { session, launch, replayed: false };
     } catch (error) {
       this.pending.delete(launch.id);
-      registered.catch(() => undefined);
       throw error;
     }
   }
@@ -136,12 +149,12 @@ export class HostLaunchCoordinator {
     const pending = { hostId: session.hostId, sessionId: session.sessionId, launch: session.launch, cwd: session.launch.folder, name: session.name };
     this.pending.set(session.launch.id, pending);
     const registered = this.waitForSession(session.key);
+    registered.catch(() => undefined);
     try {
       await this.requestHost(session.hostId, { type: "launch_start", requestId: randomUUID(), launchId: session.launch.id, sessionId: session.sessionId, cwd: pending.cwd, name: pending.name });
       await registered;
     } catch (error) {
       this.pending.delete(session.launch.id);
-      registered.catch(() => undefined);
       throw error;
     }
   }

@@ -213,6 +213,7 @@ export class InboxHub {
       try {
         const sockets = this.agents.get(host.id);
         if (!sockets?.delete(socket)) return;
+        await this.launch.closed(host, socket);
         for (const [sessionKey, route] of this.sessionAgents) {
           if (route.socket !== socket) continue;
           this.sessionAgents.delete(sessionKey);
@@ -237,7 +238,7 @@ export class InboxHub {
 
   async handleAgentMessage(host, socket, message) {
     if (message.type === "ping") return socketSend(socket, { type: "pong" });
-    if (message.type === "host_hello") return this.launch.hello(host, message);
+    if (message.type === "host_hello") return this.launch.hello(host, message, socket);
     if (message.type === "launch_result") return this.launch.result(message);
     const sessionId = requireString(message.sessionId, "sessionId", 300);
     const generation = requireString(message.generation, "generation", 100);
