@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
 import { HostLauncher } from "./host-launch.js";
+import { chunkSnapshotMessages } from "./history-sync.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type Identity = { hostId: string; publicKey: string; privateKey: string };
@@ -290,7 +291,18 @@ class PiInboxRuntime {
 
   snapshot(status: string, full = false) {
     this.latestSnapshot = buildSnapshot(this.ctx, this.generation, status, !full);
-    this.send({ type: full ? "session_upsert" : "session_patch", sessionId: this.latestSnapshot.sessionId, generation: this.generation, session: this.latestSnapshot });
+    if (!full) {
+      this.send({ type: "session_patch", sessionId: this.latestSnapshot.sessionId, generation: this.generation, session: this.latestSnapshot });
+      return;
+    }
+    for (const [index, messages] of chunkSnapshotMessages(this.latestSnapshot.messages).entries()) {
+      this.send({
+        type: index === 0 ? "session_upsert" : "session_patch",
+        sessionId: this.latestSnapshot.sessionId,
+        generation: this.generation,
+        session: { ...this.latestSnapshot, messages }
+      });
+    }
   }
 
   event(event: Record<string, unknown>) {
