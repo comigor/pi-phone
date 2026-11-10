@@ -425,6 +425,7 @@ test("replies follow the current generation and offline delivery is retryable", 
     headers: { authorization: "Bearer test-token", "content-type": "application/json" },
     body: JSON.stringify({ idempotency_key: "offline-reply", words: "Send later" })
   });
-  assert.equal(offline.status, 503);
-  assert.equal((await offline.json()).code, "session_offline");
+  assert.equal(offline.status, 202);
+  assert.equal((await offline.json()).outbox.key, "offline-reply");
+  assert.equal(hub.store.getSession(sessionKey).pendingReplies[0].text, "Send later");
 });

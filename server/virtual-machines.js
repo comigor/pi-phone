@@ -151,6 +151,7 @@ export class VirtualMachines {
     this.messageCache = new WeakMap();
     this.changeBatches = new Map();
     this.writeQueue = Promise.resolve();
+    this.replyFlushes = new Map();
   }
 
   async load() {
@@ -821,19 +822,57 @@ export class VirtualMachines {
     const text = combined || (attachments.every((attachment) => attachment.mimeType?.startsWith("image/")) ? "Image attached" : "Files attached");
     const previous = (session.remoteReplies || []).find((message) => message.requestId === key);
     if (previous) return send(response, 200, { reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
-    await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });
+    const pending = {
+      requestId: key,
+      text,
+      attachments: attachments.map((attachment) => ({ ...attachment, data: attachment.data ? Buffer.from(attachment.data).toString("base64") : "" })),
+      clearDraft: typeof body.clear_draft === "string" ? body.clear_draft : null,
+      combined,
+      uploadIds: Array.isArray(body.uploads) ? body.uploads : [],
+      annotationIds: Array.isArray(body.annotation_ids) ? body.annotation_ids.filter((value) => typeof value === "string") : []
+    };
+    const queued = (session.pendingReplies || []).find((reply) => reply.requestId === key);
+    if (queued) return send(response, 202, { outbox: { key, words: queued.combined, thread: session.name, state: "queued" } });
+    try {
+      await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments });
+    } catch (error) {
+      if (error.code !== "session_offline") throw error;
+      await this.store.queueRemoteReply(session.key, pending);
+      return send(response, 202, { outbox: { key, words: combined, thread: session.name, state: "queued" } });
+    }
+    await this.finishReply(session, pending);
+    const reply = this.virtualMessage(session, session.remoteReplies.find((message) => message.requestId === key), session.messages.length);
+    if (compose) return send(response, 200, { thread_id: id("msg", session.key), message: reply, project: projectFor(session), replayed: false });
+    return send(response, 200, { reply });
+  }
+
+  async finishReply(session, pending) {
     if (session.resolvedAt) await this.store.updateVirtualSession(session.key, { resolvedAt: null, backFromArchive: false });
-    const appended = await this.store.appendRemoteReply(session.key, { requestId: key, text, attachments });
-    if (typeof body.clear_draft === "string") await this.drafts.clearSent(id("msg", session.key), body.clear_draft, combined, Array.isArray(body.uploads) ? body.uploads : []);
+    const appended = await this.store.appendRemoteReply(session.key, pending);
+    if (pending.clearDraft) await this.drafts.clearSent(id("msg", session.key), pending.clearDraft, pending.combined, pending.uploadIds);
     const reply = this.virtualMessage(session, appended.message, session.messages.length);
-    const annotationIds = new Set(Array.isArray(body.annotation_ids) ? body.annotation_ids.filter((value) => typeof value === "string") : []);
+    const annotationIds = new Set(pending.annotationIds || []);
     for (const record of session.messageAnnotations || []) {
       if (annotationIds.has(record.id) && !record.removed_at) record.sent_reply_id = reply.id;
     }
     if (annotationIds.size) await this.store.persist();
     await this.changed(session);
-    if (compose) return send(response, 200, { thread_id: id("msg", session.key), message: reply, project: projectFor(session), replayed: false });
-    return send(response, 200, { reply });
+  }
+
+  async flushReplies(session) {
+    if (!session.pendingReplies?.length) return;
+    const existing = this.replyFlushes.get(session.key);
+    if (existing) return existing;
+    const flush = (async () => {
+      while (session.pendingReplies?.length) {
+        const pending = session.pendingReplies[0];
+        await this.deliverReply({ key: session.key, generation: session.generation, requestId: pending.requestId, text: pending.text, attachments: pending.attachments || [] });
+        await this.finishReply(session, pending);
+        await this.store.completeRemoteReply(session.key, pending.requestId);
+      }
+    })().finally(() => this.replyFlushes.delete(session.key));
+    this.replyFlushes.set(session.key, flush);
+    return flush;
   }
 
   async route(request, response) {

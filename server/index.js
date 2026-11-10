@@ -252,6 +252,7 @@ export class InboxHub {
       await this.virtual.ensureLinked(host);
       this.sessionAgents.set(key, { socket, generation });
       await this.launch.onSessionUpsert(session);
+      void this.virtual.flushReplies(session).catch((error) => console.warn(`Queued replies remain pending for ${session.name || key}: ${error.message}`));
       if (session.status === "running") {
         await this.store.resolveSessionInbox(key);
         this.broadcastState();
