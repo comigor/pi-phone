@@ -494,10 +494,32 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     assert.equal(response.status, 200);
     return response.json();
   };
+  const centralHasPin = async () => {
+    const model = await (await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads?machines=1`)).json();
+    return model.pins?.some((thread) => thread.thread_id === listed.thread_id);
+  };
+  const eventStream = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/events`, {
+    headers: { accept: "text/event-stream" }, signal: AbortSignal.timeout(6_000)
+  });
+  const eventReader = eventStream.body.getReader();
+  const pinEvent = (async () => {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await eventReader.read();
+      if (done) return false;
+      buffer += decoder.decode(value, { stream: true });
+      if (buffer.includes("event: pins")) return true;
+    }
+  })();
   const pinned = await pin(true);
+  assert.ok(await pinEvent);
+  await eventReader.cancel();
   const pinEntry = pinned.pins.find((thread) => thread.thread_id === listed.thread_id);
   assert.ok(pinEntry);
+  await waitFor(async () => await centralHasPin() ? true : undefined);
   assert.ok(!(await pin(false)).pins.some((thread) => thread.thread_id === listed.thread_id));
+  await waitFor(async () => !(await centralHasPin()) ? true : undefined);
   const restoredPin = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/pins`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ serverSession: centralHealth.serverSession, restore: { thread_id: listed.thread_id, index: 0, pinned_at: pinEntry.pinned_at } })

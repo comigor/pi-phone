@@ -519,7 +519,6 @@ export class VirtualMachines {
   pinEntries(hostId) {
     return this.pinnedSessions(hostId).map((session) => ({ thread_id: id("msg", session.key), pinned_at: session.pinnedAt }));
   }
-
   async setPin(session, pinned, restore) {
     await this.store.updateVirtualSession(session.key, {
       pinnedAt: pinned ? restore?.pinned_at || session.pinnedAt || new Date().toISOString() : null,
@@ -538,6 +537,7 @@ export class VirtualMachines {
       await this.changed(session, { thread_id: threadId }, "pins");
     }
   }
+
 
   list(machine) {
     const all = this.sessions(machine);
