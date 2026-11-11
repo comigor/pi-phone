@@ -5,6 +5,7 @@ import path from "node:path";
 import WebSocket from "ws";
 import { HostLauncher } from "./host-launch.js";
 import { chunkSnapshotMessages, snapshotMessages } from "./history-sync.js";
+import { isSubagentSession } from "./session-scope.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type Identity = { hostId: string; publicKey: string; privateKey: string };
@@ -319,6 +320,8 @@ export default function (pi: ExtensionAPI) {
   let runtime: PiInboxRuntime | undefined;
   pi.on("session_start", async (_event, ctx) => {
     runtime?.dispose();
+    runtime = undefined;
+    if (isSubagentSession()) return;
     runtime = new PiInboxRuntime(pi, ctx);
     await runtime.start();
   });
