@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { sessionKey } from "./protocol.js";
+import { isVisibleMessage } from "./visible-messages.js";
 
 const MAX_INBOX_ITEMS = 500;
 
@@ -13,6 +14,10 @@ function excerpt(value, length = 500) {
   return typeof value === "string" ? value.slice(0, length) : "";
 }
 
+function presentation(session) {
+  return JSON.stringify([session.online === true, session.status || "idle", session.cwd || "", session.name || "", session.model || "", session.thinkingLevel || ""]);
+}
+
 export class InboxStore {
   constructor(dataDir) {
     this.dataDir = dataDir;
@@ -20,6 +25,7 @@ export class InboxStore {
     this.writeVersion = 0;
     this.writtenVersion = 0;
     this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [] };
+    this.sessionChanges = new Map();
   }
 
   async load() {
@@ -131,6 +137,19 @@ export class InboxStore {
     await this.persist();
   }
 
+  sessionChange(key) {
+    return this.sessionChanges.get(key) || { message: false, presentation: false };
+  }
+
+  recordSessionChange(key, session, previousMessages, previousPresentation, previousUpdatedAt, changedAt) {
+    const message = previousMessages !== JSON.stringify(session.messages.filter(isVisibleMessage));
+    const presentationChanged = previousPresentation !== presentation(session);
+    this.sessionChanges.set(key, { message, presentation: presentationChanged });
+    if (message || presentationChanged) session.visibleUpdatedAt = changedAt;
+    else session.visibleUpdatedAt ??= previousUpdatedAt;
+    return message || presentationChanged;
+  }
+
   async upsertSession(hostId, incoming) {
     const key = sessionKey(hostId, incoming.sessionId);
     let session = this.state.sessions.find((item) => item.key === key);
@@ -138,11 +157,13 @@ export class InboxStore {
       session = { key, hostId, sessionId: incoming.sessionId, generation: incoming.generation, messages: [], remoteReplies: [], virtualCursor: 0 };
       this.state.sessions.push(session);
     }
+    const previousVisible = JSON.stringify(session.messages.filter(isVisibleMessage));
+    const previousPresentation = presentation(session);
+    const previousUpdatedAt = session.updatedAt;
     const previousMessages = new Map(session.messages.map((message) => [message.id, message]));
     const arrivedAt = new Date().toISOString();
     const nextMessages = cleanMessages(incoming.messages).map((message) => ({ ...message, createdAt: message.createdAt || previousMessages.get(message.id)?.createdAt || arrivedAt }));
     const messagesChanged = JSON.stringify(session.messages) !== JSON.stringify(nextMessages);
-    const changed = session.status !== (incoming.status || "idle") || messagesChanged;
     Object.assign(session, {
       generation: incoming.generation,
       cwd: excerpt(incoming.cwd, 2048),
@@ -152,14 +173,15 @@ export class InboxStore {
       status: excerpt(incoming.status, 40) || "idle",
       messages: nextMessages,
       online: true,
-      updatedAt: new Date().toISOString()
+      updatedAt: arrivedAt
     });
+    const visibleChanged = this.recordSessionChange(key, session, previousVisible, previousPresentation, previousUpdatedAt, arrivedAt);
     if (messagesChanged && session.resolvedAt && nextMessages.at(-1)?.role === "assistant") {
       session.resolvedAt = null;
       session.backFromArchive = true;
     }
     session.remoteReplies ??= [];
-    session.virtualCursor = (session.virtualCursor ?? 0) + (changed ? 1 : 0);
+    session.virtualCursor = (session.virtualCursor ?? 0) + (visibleChanged || messagesChanged ? 1 : 0);
     await this.persist();
     return session;
   }
@@ -168,21 +190,22 @@ export class InboxStore {
     const key = sessionKey(hostId, incoming.sessionId);
     const session = this.getSession(key);
     if (!session) return undefined;
-    let changed = session.status !== (incoming.status || "idle");
+    const previousVisible = JSON.stringify(session.messages.filter(isVisibleMessage));
+    const previousPresentation = presentation(session);
+    const previousUpdatedAt = session.updatedAt;
     let messagesChanged = false;
     for (const next of cleanMessages(incoming.messages)) {
       const index = session.messages.findIndex((message) => message.id === next.id);
       next.createdAt ??= session.messages[index]?.createdAt || new Date().toISOString();
       if (index < 0) {
         session.messages.push(next);
-        changed = true;
         messagesChanged = true;
       } else if (JSON.stringify(session.messages[index]) !== JSON.stringify(next)) {
         session.messages[index] = next;
-        changed = true;
         messagesChanged = true;
       }
     }
+    const changedAt = new Date().toISOString();
     Object.assign(session, {
       generation: incoming.generation,
       cwd: excerpt(incoming.cwd, 2048),
@@ -191,13 +214,14 @@ export class InboxStore {
       thinkingLevel: excerpt(incoming.thinkingLevel, 40),
       status: excerpt(incoming.status, 40) || "idle",
       online: true,
-      updatedAt: new Date().toISOString()
+      updatedAt: changedAt
     });
+    const visibleChanged = this.recordSessionChange(key, session, previousVisible, previousPresentation, previousUpdatedAt, changedAt);
     if (messagesChanged && session.resolvedAt && session.messages.at(-1)?.role === "assistant") {
       session.resolvedAt = null;
       session.backFromArchive = true;
     }
-    session.virtualCursor = (session.virtualCursor ?? 0) + (changed ? 1 : 0);
+    session.virtualCursor = (session.virtualCursor ?? 0) + (visibleChanged || messagesChanged ? 1 : 0);
     await this.persist();
     return session;
   }
