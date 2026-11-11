@@ -108,7 +108,9 @@ export class InboxHub {
       deleteLaunch: (session) => hub.launch.delete(session),
       listFolders: (input) => hub.launch.listFolders(input.hostId, input.path),
       cloneCheck: (input) => hub.launch.cloneCheck(input.hostId, input.url),
-      cloneTarget: (input) => hub.launch.cloneTarget(input.hostId, input.url, input.into)
+      cloneTarget: (input) => hub.launch.cloneTarget(input.hostId, input.url, input.into),
+      listSkills: (input) => hub.launch.listSkills(input.hostId),
+      readSkillContent: (input) => hub.launch.readSkillContent(input.hostId, input.name)
     });
     await hub.virtual.load();
     push.targetFor = (item) => hub.virtual.notificationTarget(item);
@@ -246,7 +248,7 @@ export class InboxHub {
   async handleAgentMessage(host, socket, message) {
     if (message.type === "ping") return socketSend(socket, { type: "pong" });
     if (message.type === "host_hello") return this.launch.hello(host, message, socket);
-    if (["launch_result", "folder_list_result", "clone_check_result", "clone_target_result"].includes(message.type)) return this.launch.result(message);
+    if (["launch_result", "folder_list_result", "clone_check_result", "clone_target_result", "skill_list_result", "skill_content_result"].includes(message.type)) return this.launch.result(message);
     const sessionId = requireString(message.sessionId, "sessionId", 300);
     const generation = requireString(message.generation, "generation", 100);
     const key = `${host.id}:${sessionId}`;

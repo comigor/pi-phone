@@ -5,6 +5,7 @@ import path from "node:path";
 import WebSocket from "ws";
 import { HostLauncher } from "./host-launch.js";
 import { checkGitRemote, cloneTarget, listFolders } from "./host-folders.js";
+import { listSkills, readSkillContent } from "./host-skills.js";
 import { chunkSnapshotMessages, snapshotMessages } from "./history-sync.js";
 import { isSubagentSession } from "./session-scope.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -160,6 +161,10 @@ class PiInboxRuntime {
       this.handleCreation(message);
       return;
     }
+    if (["skill_list", "skill_content"].includes(message.type)) {
+      this.handleSkills(message);
+      return;
+    }
     if (["launch_start", "launch_stop", "launch_delete"].includes(message.type)) {
       this.handleLaunch(message);
       return;
@@ -175,7 +180,7 @@ class PiInboxRuntime {
     }
     if (message.type === "paired") {
       this.canSend = true;
-      this.send({ type: "host_hello", launch: { agents: ["pi"], home: os.homedir(), creation: 1 } });
+      this.send({ type: "host_hello", skills: 1, launch: { agents: ["pi"], home: os.homedir(), creation: 1 } });
       this.pairingCode = undefined;
       this.setStatus(undefined);
       this.snapshot(this.latestSnapshot.status, true);
@@ -232,6 +237,24 @@ class PiInboxRuntime {
     } catch (error) {
       this.completeReply(message.requestId, { ok: false, error: error instanceof Error ? error.message : "Reply failed" });
     }
+  }
+
+  private handleSkills(message: { type: string; requestId: string; name?: string }) {
+    const task = (async () => {
+      try {
+        if (message.type === "skill_list") {
+          const skills = await listSkills();
+          this.send({ type: "skill_list_result", requestId: message.requestId, ok: true, skills });
+        } else {
+          const skill = await readSkillContent(message.name || "");
+          this.send({ type: "skill_content_result", requestId: message.requestId, ok: true, skill });
+        }
+      } catch (error) {
+        this.send({ type: `${message.type}_result`, requestId: message.requestId, ok: false, error: error instanceof Error ? error.message : "Skill operation failed" });
+      }
+    })();
+    this.launchTasks.add(task);
+    void task.finally(() => this.launchTasks.delete(task));
   }
 
   private handleCreation(message: { type: string; requestId: string; path?: string; url?: string; into?: string }) {

@@ -386,7 +386,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   });
 
   await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
-  agent.send(JSON.stringify({ type: "host_hello", launch: { agents: ["pi"], home: "/Users/igor", creation: 1 } }));
+  agent.send(JSON.stringify({ type: "host_hello", skills: 1, launch: { agents: ["pi"], home: "/Users/igor", creation: 1 } }));
   await waitFor(() => hub.store.getHost(agentIdentity.hostId)?.launch);
   const sessionId = randomUUID();
   const generation = randomUUID();
@@ -795,6 +795,22 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const folderListingResponse = await folderListingResponsePromise;
   assert.equal(folderListingResponse.status, 200);
   assert.deepEqual((await folderListingResponse.json()).folders, ["Projects"]);
+
+  const skillListRequest = nextMessage(agent, "skill_list");
+  const skillListResponsePromise = fetch(`${forwardedBase}/skills`, { headers: { origin: central, "sec-fetch-site": "same-origin" } });
+  const skillList = await skillListRequest;
+  agent.send(JSON.stringify({ type: "skill_list_result", requestId: skillList.requestId, ok: true, skills: [{ name: "alpha", root: "universal", humanOnly: false, dir: "/skills/alpha" }] }));
+  const skillListResponse = await skillListResponsePromise;
+  assert.equal(skillListResponse.status, 200);
+  assert.equal((await skillListResponse.json()).skills[0].name, "alpha");
+
+  const skillContentRequest = nextMessage(agent, "skill_content");
+  const skillContentResponsePromise = fetch(`${forwardedBase}/skills/content?name=alpha`, { headers: { origin: central, "sec-fetch-site": "same-origin" } });
+  const skillContent = await skillContentRequest;
+  agent.send(JSON.stringify({ type: "skill_content_result", requestId: skillContent.requestId, ok: true, skill: { name: "alpha", content: "Use alpha", truncated: false, humanOnly: false } }));
+  const skillContentResponse = await skillContentResponsePromise;
+  assert.equal(skillContentResponse.status, 200);
+  assert.equal((await skillContentResponse.json()).skill.content, "Use alpha");
 
   const scratchRequest = nextMessage(agent, "launch_start");
   const scratchResponsePromise = fetch(`${forwardedBase}/messages`, {
