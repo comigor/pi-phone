@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { attachmentKind, isTextAttachment, sendAttachmentBytes } from "./attachments.js";
 import { paginateSearchAnswer, searchVirtualSessions } from "./search.js";
+import { questionSummary, structuredQuestions } from "./structured.js";
 import { isVisibleMessage } from "./visible-messages.js";
 
 const ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -325,17 +326,20 @@ export class VirtualMachines {
     const project = projectFor(session);
     const mid = messageId(session, message, index);
     const attachments = (message.attachments || message.images || []).map((item, attachmentIndex) => attachmentFor(session, message, item, attachmentIndex, index));
+    const body = message.text || (attachments.length ? `![${attachments[0].name}](${attachments[0].name})` : "");
+    const questions = structuredQuestions(session, message, mid, body);
+    const override = session.messageOverrides?.[mid] || {};
     return {
       id: mid,
       project_id: project.id,
       thread_id: id("msg", session.key),
-      reply_to: null,
+      reply_to: message.replyTo || override.reply_to || null,
       author: message.role === "user"
         ? { kind: "person" }
         : { kind: "agent", host: "pi", session: session.sessionId, name: "Pi" },
       subject: message.role === "user" ? null : (session.name || "Pi session"),
-      subject_question: null,
-      body: message.text || (attachments.length ? `![${attachments[0].name}](${attachments[0].name})` : ""),
+      subject_question: questions[0]?.q || null,
+      body,
       created_at: message.createdAt || session.updatedAt,
       resolved_at: session.resolvedAt || null,
       idempotency_key: message.requestId || null,
@@ -345,13 +349,17 @@ export class VirtualMachines {
       ...(index === 0 ? { person_seen_seq: session.seenThroughSeq ?? null } : {}),
       ...(index === 0 && session.launch ? { launch: session.launch } : {}),
       ack: session.acks?.[mid] || null,
+      to: message.to || override.to || null,
+      ...(message.handoff || override.handoff ? { handoff: override.handoff || message.handoff } : {}),
+      ...(questions.length ? { questions } : {}),
+      ...override,
       ...(attachments.length ? { attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })) } : {})
     };
   }
 
   cachedVirtualMessage(session, message, index) {
     const mid = messageId(session, message, index);
-    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null, index === 0 ? session.seenThroughSeq ?? null : null]);
+    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null, session.messageOverrides?.[mid] || null, session.questionAnswers || null, session.actionStates || null, index === 0 ? session.seenThroughSeq ?? null : null]);
     const cached = this.messageCache.get(message);
     if (cached?.key === key) return cached.value;
     const value = this.virtualMessage(session, message, index);
@@ -396,6 +404,15 @@ export class VirtualMachines {
     return result;
   }
 
+  questionMessages(session) {
+    const result = [];
+    for (const [index, message] of this.sourceMessagesFor(session).entries()) {
+      if (Array.isArray(message.questions) || Array.isArray(message.actions) || message.text?.includes(":::question")) result.push(this.cachedVirtualMessage(session, message, index));
+    }
+    if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) result.push(this.controlMessage(session));
+    return result;
+  }
+
   lastMessage(session, messages = this.sourceMessagesFor(session)) {
     if (session.status === "running" || session.status === "waiting" || session.stopRequestedAt) return this.controlMessage(session);
     const last = messages.at(-1);
@@ -432,7 +449,7 @@ export class VirtualMachines {
       last_author: last?.author.kind || "agent",
       message_count: messageCount,
       resolved_at: session.resolvedAt || null,
-      questions: { open: 0, picked: 0, stopped: false, holds_up: [], prompt: null, actions: 0 },
+      questions: questionSummary(this.questionMessages(session)),
       waiting_on_person: waiting,
       unsent: null,
       delivery: null,
@@ -443,7 +460,7 @@ export class VirtualMachines {
       project: { id: project.id, name: project.name },
       thread_name: null,
       answered_not_sent: false,
-      reask_pending: false,
+      reask_pending: Boolean(session.remoteReplies?.some((message) => message.reask)),
       waiting_since: waiting ? activityAt(session) : null,
       unseen,
       sent: null,
@@ -941,6 +958,101 @@ export class VirtualMachines {
     return send(response, 200, { reply });
   }
 
+  structuredTarget(machine, session, body) {
+    const sessionId = body.to?.session || body.session;
+    return this.sessions(machine).find((item) => item.sessionId === sessionId && item.online && projectFor(item).id === projectFor(session).id);
+  }
+
+  async appendStructured(session, key, text, extra = {}) {
+    await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text, attachments: [] });
+    const appended = await this.store.appendRemoteReply(session.key, { requestId: key, text, attachments: [], ...extra });
+    await this.changed(session);
+    return this.virtualMessage(session, appended.message, session.messages.length);
+  }
+
+  async structuredOperation(machine, session, messageIdValue, action, body, response) {
+    const targetMessage = this.messageById(session, messageIdValue);
+    if (!targetMessage) return send(response, 404, { code: "message_not_found" });
+    const key = requireKey(body.idempotency_key);
+    if (action === "reask") {
+      if (targetMessage.author.kind !== "agent") return send(response, 422, { code: "validation_error", error: "Only agent messages can be re-asked" });
+      const questions = this.messagesFor(session).flatMap((message) => message.questions || []).filter((question) => question.state === "open");
+      if (!questions.length) return send(response, 409, { code: "nothing_to_reask", error: "There are no open questions to re-ask" });
+      const previous = session.remoteReplies?.find((message) => message.requestId === key);
+      if (previous) return send(response, 200, { message_id: messageIdValue, questions, reply: this.virtualMessage(session, previous, session.messages.length), replayed: true }, { "idempotent-replayed": "true" });
+      const text = `The person asked for the open questions to be asked again in one new message:\n\n${questions.map((question) => `- ${question.q}`).join("\n")}`;
+      const reply = await this.appendStructured(session, key, text, { reask: questions.map((question) => question.key), replyTo: messageIdValue });
+      return send(response, 200, { message_id: messageIdValue, questions, reply, replayed: false });
+    }
+    if (action === "send-now") {
+      session.messageOverrides ??= {};
+      session.messageOverrides[messageIdValue] = { ...session.messageOverrides[messageIdValue], deliver_now_at: new Date().toISOString(), deliver_now_by: "person" };
+      await this.store.persist();
+      await this.deliverReply({ key: session.key, generation: session.generation, requestId: key, text: targetMessage.body, attachments: [] });
+      await this.changed(session);
+      return send(response, 200, { message: this.messageById(session, messageIdValue) });
+    }
+    if (action === "to" || action === "handoff/undo") {
+      if (session.resolvedAt) return send(response, 409, { code: "thread_resolved", error: "The thread is archived" });
+      if (action === "to" && targetMessage.author.kind !== "person") return send(response, 422, { code: "not_addressed", error: "Only a person message can be readdressed" });
+      if (action === "handoff/undo" && !targetMessage.handoff) return send(response, 422, { code: "validation_error", error: "This message is not a handoff" });
+      const target = action === "to" ? this.structuredTarget(machine, session, body) : this.sessions(machine).find((item) => item.sessionId === targetMessage.handoff.from && item.online);
+      if (!target) return send(response, 409, { code: "session_not_live", error: "Session is not live" });
+      const to = { host: "pi", session: target.sessionId };
+      session.messageOverrides ??= {};
+      session.messageOverrides[messageIdValue] = { ...session.messageOverrides[messageIdValue], to, ...(action === "handoff/undo" ? { handoff: { ...targetMessage.handoff, undone_at: new Date().toISOString() } } : {}) };
+      await this.store.persist();
+      await this.deliverReply({ key: target.key, generation: target.generation, requestId: key, text: targetMessage.body, attachments: [] });
+      await this.changed(session);
+      return send(response, 200, { message: this.messageById(session, messageIdValue), row: this.row(session) });
+    }
+    return send(response, 404, { code: "device_route_not_found" });
+  }
+
+  async markAction(session, messageIdValue, actionId, body, response) {
+    const message = this.messageById(session, messageIdValue);
+    const question = message?.questions?.find((item) => item.key === actionId);
+    if (!question) return send(response, 404, { code: "question_not_found" });
+    if (question.kind !== "action") return send(response, 422, { code: "validation_error", error: "This question is not an action" });
+    session.actionStates ??= {};
+    session.actionStates[`${messageIdValue}:${actionId}`] = { outcome: body.outcome ?? null, note: typeof body.note === "string" ? body.note : null, at: new Date().toISOString() };
+    await this.store.persist();
+    await this.changed(session);
+    return send(response, 200, { questions: this.messageById(session, messageIdValue).questions });
+  }
+
+  async threadMessage(machine, session, body, response) {
+    const text = typeof body.body === "string" ? body.body.trim() : "";
+    if (!text) return send(response, 422, { code: "validation_error", error: "A message body is required" });
+    if (session.resolvedAt) return send(response, 409, { code: "thread_resolved", error: "The thread is archived" });
+    const target = this.structuredTarget(machine, session, body);
+    if (!target) return send(response, 409, { code: "session_not_live", error: "Session is not live" });
+    const key = requireKey(body.idempotency_key);
+    const previous = target.remoteReplies?.find((message) => message.requestId === key);
+    if (previous) return send(response, 200, { message: this.virtualMessage(target, previous, target.messages.length), replayed: true }, { "idempotent-replayed": "true" });
+    const message = await this.appendStructured(target, key, text, { to: { host: "pi", session: target.sessionId } });
+    return send(response, 200, { message, replayed: false });
+  }
+
+  async pickAnswers(session, messageIdValue, body, response) {
+    const message = this.messageById(session, messageIdValue);
+    if (!message) return send(response, 404, { code: "message_not_found" });
+    const picks = Array.isArray(body.picks) ? body.picks : [];
+    session.questionAnswers ??= {};
+    const lines = [];
+    for (const pick of picks) {
+      const question = message.questions?.find((item) => item.key === pick.question);
+      const choice = question?.choices?.find((item) => item.label === pick.choice);
+      if (!question || !choice) return send(response, 422, { code: "validation_error", error: "Unknown question or choice" });
+      session.questionAnswers[`${messageIdValue}:${question.key}`] = { choice: choice.label, at: new Date().toISOString() };
+      lines.push(`- ${question.q}: ${choice.label}`);
+    }
+    if (!lines.length) return send(response, 422, { code: "validation_error", error: "At least one pick is required" });
+    await this.store.persist();
+    const reply = await this.appendStructured(session, requireKey(body.idempotency_key), `Answers to ${messageIdValue}:\n${lines.join("\n")}`, { replyTo: messageIdValue });
+    return send(response, 200, { message: this.messageById(session, messageIdValue), reply });
+  }
+
   async finishReply(session, pending) {
     if (session.resolvedAt) await this.store.updateVirtualSession(session.key, { resolvedAt: null, backFromArchive: false });
     const appended = await this.store.appendRemoteReply(session.key, pending);
@@ -1339,6 +1451,26 @@ export class VirtualMachines {
         return send(response, status, { code: error.code || "launch_failed", error: error.message });
       }
     }
+    match = route.match(new RegExp("^threads/([^/]+)/message$"));
+    if (match && request.method === "POST") {
+      const session = this.session(machine, match[1]);
+      return session ? this.threadMessage(machine, session, await bodyJson(request), response) : send(response, 404, { code: "thread_not_found" });
+    }
+    match = route.match(new RegExp("^messages/([^/]+)/(to|send-now|reask)$"));
+    if (match && request.method === "POST") {
+      const session = this.findByMessage(machine, match[1]);
+      return session ? this.structuredOperation(machine, session, match[1], match[2], await bodyJson(request), response) : send(response, 404, { code: "message_not_found" });
+    }
+    match = route.match(new RegExp("^messages/([^/]+)/handoff/undo$"));
+    if (match && request.method === "POST") {
+      const session = this.findByMessage(machine, match[1]);
+      return session ? this.structuredOperation(machine, session, match[1], "handoff/undo", await bodyJson(request), response) : send(response, 404, { code: "message_not_found" });
+    }
+    match = route.match(new RegExp("^messages/([^/]+)/actions/([^/]+)$"));
+    if (match && request.method === "POST") {
+      const session = this.findByMessage(machine, match[1]);
+      return session ? this.markAction(session, match[1], match[2], await bodyJson(request), response) : send(response, 404, { code: "message_not_found" });
+    }
     match = route.match(new RegExp("^messages/([^/]+)/reply$"));
     if (match && request.method === "POST") {
       const session = this.findByMessage(machine, match[1]);
@@ -1348,8 +1480,9 @@ export class VirtualMachines {
     match = route.match(new RegExp("^messages/([^/]+)/picks$"));
     if (match && request.method === "POST") {
       const session = this.findByMessage(machine, match[1]);
-      if (!session || match[1] !== id("msg", session.key, "stop-control")) return send(response, 404, { code: "message_not_found" });
+      if (!session) return send(response, 404, { code: "message_not_found" });
       const body = await bodyJson(request);
+      if (match[1] !== id("msg", session.key, "stop-control")) return this.pickAnswers(session, match[1], body, response);
       if (!JSON.stringify(body.picks).includes("Stop agent")) return send(response, 422, { code: "validation_error", error: "Unknown choice" });
       await this.stopSession({ key: session.key, generation: session.generation, requestId: requireKey(body.idempotency_key) });
       await this.store.updateVirtualSession(session.key, { stopRequestedAt: new Date().toISOString() });
