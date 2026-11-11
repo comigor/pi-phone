@@ -401,7 +401,13 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
       name: "contract-session",
       model: "test/model",
       status: "running",
-      messages: [{ id: "assistant-1", role: "assistant", text: "Remote assistant", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] }]
+      messages: [{ id: "assistant-1", role: "assistant", text: "Remote assistant", attachments: [
+        { data: "aW1hZ2U=", mimeType: "image/png", name: "pixel.png" },
+        { data: Buffer.from("# Note\nBody text\n").toString("base64"), mimeType: "text/markdown", name: "note.md" },
+        { data: Buffer.from("<!doctype html><h1>Attached</h1>").toString("base64"), mimeType: "text/html", name: "page.html" },
+        { data: Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypisom0123456789")]).toString("base64"), mimeType: "video/mp4", name: "clip.mp4" },
+        { data: Buffer.from("ID3recording-audio").toString("base64"), mimeType: "audio/mpeg", name: "voice.mp3" }
+      ] }]
     }
   }));
 
@@ -448,6 +454,64 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const imageResponse = await fetch(`${forwardedBase}/attachments/${image.id}/image`);
   assert.equal(imageResponse.status, 200);
   assert.equal(Buffer.from(await imageResponse.arrayBuffer()).toString(), "image");
+  const imageEtag = imageResponse.headers.get("etag");
+  assert.ok(imageEtag);
+  assert.equal((await fetch(`${forwardedBase}/attachments/${image.id}/image`, { headers: { "if-none-match": imageEtag } })).status, 304);
+  const messageImage = await fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/image?path=pixel.png`);
+  assert.equal(messageImage.status, 200);
+  const descriptors = opened.thread.messages[0].attachments;
+  const note = descriptors.find((item) => item.name === "note.md");
+  const html = descriptors.find((item) => item.name === "page.html");
+  const video = descriptors.find((item) => item.name === "clip.mp4");
+  const audio = descriptors.find((item) => item.name === "voice.mp3");
+  assert.equal(note.kind, "markdown");
+  assert.equal(video.kind, "video");
+  assert.equal(audio.kind, "audio");
+  const noteView = await (await fetch(`${forwardedBase}/attachments/${note.id}/view`)).json();
+  assert.equal(noteView.text, "# Note\nBody text\n");
+  assert.equal(noteView.attachment.kind, "markdown");
+  const rawNote = await fetch(`${forwardedBase}/attachments/${note.id}`);
+  assert.equal(rawNote.headers.get("content-type"), "text/plain; charset=utf-8");
+  assert.equal(await rawNote.text(), "# Note\nBody text\n");
+  const htmlView = await (await fetch(`${forwardedBase}/attachments/${html.id}/view`)).json();
+  assert.match(htmlView.html, /Attached/);
+  const htmlPage = await fetch(`${forwardedBase}/attachments/${html.id}/page`);
+  assert.equal(htmlPage.status, 200);
+  assert.match(htmlPage.headers.get("content-security-policy"), /sandbox/);
+  const videoRange = await fetch(`${forwardedBase}/attachments/${video.id}/video`, { headers: { range: "bytes=4-11" } });
+  assert.equal(videoRange.status, 206);
+  assert.equal(videoRange.headers.get("content-range"), `bytes 4-11/${video.size}`);
+  assert.equal(await videoRange.text(), "ftypisom");
+  const audioSuffix = await fetch(`${forwardedBase}/attachments/${audio.id}/audio`, { headers: { range: "bytes=-5" } });
+  assert.equal(audioSuffix.status, 206);
+  assert.equal(await audioSuffix.text(), "audio");
+  const noteHead = await fetch(`http://127.0.0.1:${addresses.door.port}/api/inbox/device/attachments/${note.id}/download`, { method: "HEAD", headers: { authorization: `Bearer ${hub.virtual.machines.get(agentIdentity.hostId).token}` } });
+  assert.equal(noteHead.status, 200);
+  assert.equal(noteHead.headers.get("content-length"), String(note.size));
+  assert.equal((await fetch(`${forwardedBase}/attachments/${note.id}/download`, { headers: { range: "bytes=999-1000" } })).status, 416);
+  assert.equal((await fetch(`${forwardedBase}/attachments/${note.id}/image`)).status, 422);
+  const reused = await fetch(`http://127.0.0.1:${addresses.door.port}/api/inbox/device/uploads/reuse`, { method: "POST", headers: { authorization: `Bearer ${hub.virtual.machines.get(agentIdentity.hostId).token}`, "content-type": "application/json" }, body: JSON.stringify({ attachment_id: note.id, version: "sent" }) });
+  assert.equal(reused.status, 200);
+  assert.equal((await reused.json()).upload.kind, "markdown");
+  const directDoor = `http://127.0.0.1:${addresses.door.port}/api/inbox/device`;
+  const directHeaders = { authorization: `Bearer ${hub.virtual.machines.get(agentIdentity.hostId).token}` };
+  const markupResponse = await fetch(`${directDoor}/markups`, { method: "POST", headers: { ...directHeaders, "content-type": "image/png" }, body: Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from("drawing")]) });
+  assert.equal(markupResponse.status, 200);
+  const markup = await markupResponse.json();
+  assert.match(markup.name, /^[0-9a-f]{64}\.png$/);
+  const markupImage = await fetch(`${directDoor}/markups/${markup.name}`, { headers: directHeaders });
+  assert.equal(markupImage.status, 200);
+  assert.equal(markupImage.headers.get("content-type"), "image/png");
+  assert.equal((await fetch(`${directDoor}/markups`, { method: "POST", headers: directHeaders, body: "<svg/>" })).status, 422);
+  const imageAnnotation = await fetch(`${directDoor}/annotations`, { method: "POST", headers: { ...directHeaders, "content-type": "application/json" }, body: JSON.stringify({ attachment_id: image.id, version: "current", annotation: { id: "ann-image", type: "COMMENT", text: "The button is cut off", originalText: "pixel.png", images: [{ path: markup.path, name: "drawing" }] } }) });
+  assert.equal(imageAnnotation.status, 200);
+  assert.equal((await imageAnnotation.json()).annotation.attachment_id, image.id);
+  const codeAnnotation = await fetch(`${directDoor}/annotations`, { method: "POST", headers: { ...directHeaders, "content-type": "application/json" }, body: JSON.stringify({ attachment_id: note.id, version: "current", annotation: { id: "ann-code", type: "COMMENT", text: "Tighten this section", originalText: "Body text" } }) });
+  assert.equal(codeAnnotation.status, 200);
+  const pendingWithMarkup = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}/attachments`)).json();
+  assert.ok(pendingWithMarkup.annotations.some((item) => item.id === "ann-image"));
+  assert.ok(pendingWithMarkup.annotations.some((item) => item.id === "ann-code"));
+  assert.equal((await fetch(`${directDoor}/annotations`, { method: "POST", headers: { ...directHeaders, "content-type": "application/json" }, body: JSON.stringify({ attachment_id: audio.id, annotation: { id: "ann-audio", text: "Not allowed" } }) })).status, 422);
 
   const archiveWrite = (resolved) => fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/resolve`, {
     method: "POST", headers: { "content-type": "application/json", origin: central },
@@ -688,7 +752,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const annotation = (await annotationResponse.json()).annotation;
   assert.equal(annotation.message_id, opened.thread.messages[0].id);
   const pendingAttachments = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}/attachments`)).json();
-  assert.equal(pendingAttachments.annotations.length, 1);
+  assert.equal(pendingAttachments.annotations.length, 3);
   const beforeAnnotationReply = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}`)).json();
   const annotationReplyDelivery = nextMessage(agent, "reply");
   const annotationReplyResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/reply`, {
@@ -705,7 +769,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   agent.send(JSON.stringify({ type: "reply_result", requestId: annotationReply.requestId, sessionId, generation, ok: true }));
   assert.equal((await annotationReplyResponse).status, 200);
   const sentAttachments = await (await fetch(`${forwardedBase}/threads/${listed.thread_id}/attachments`)).json();
-  assert.equal(sentAttachments.annotations.length, 0);
+  assert.equal(sentAttachments.annotations.length, 2);
 
   const ackDelivery = nextMessage(agent, "reply");
   const ackResponse = fetch(`${forwardedBase}/messages/${opened.thread.messages[0].id}/ack`, {
@@ -917,4 +981,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
     const session = hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`);
     return session.pendingReplies.length === 0 && session.remoteReplies.some((entry) => entry.requestId === held.key) ? true : undefined;
   });
+
+  await hub.virtual.cleanupMarkups(hub.store.getSession(`${agentIdentity.hostId}:${sessionId}`));
+  assert.equal(hub.virtual.markups.has(markup.name), false);
 });
