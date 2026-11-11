@@ -143,6 +143,9 @@ export class VirtualMachines {
     this.stopSession = options.stopSession;
     this.startLaunch = options.startLaunch;
     this.stopLaunch = options.stopLaunch;
+    this.listFolders = options.listFolders;
+    this.cloneCheck = options.cloneCheck;
+    this.cloneTarget = options.cloneTarget;
     this.linkMachine = options.linkMachine;
     this.publicAddress = options.publicAddress;
     this.file = path.join(options.dataDir, "virtual-machines.json");
@@ -791,16 +794,59 @@ export class VirtualMachines {
   }
 
 
+  creationHost(machine, request, response) {
+    if (request.headers["x-plannotator-window"] !== "1") {
+      send(response, 403, { code: "window_only", error: "Folder operations require the Inbox window" });
+      return null;
+    }
+    const host = this.store.getHost(machine.hostId);
+    if (!host?.online) {
+      send(response, 503, { code: "machine_offline", error: "Host is offline" });
+      return null;
+    }
+    if (host.launch?.creation !== 1) {
+      send(response, 409, { code: "agent_unavailable", error: "Host launch creation is unavailable" });
+      return null;
+    }
+    return host;
+  }
+
+  async creationResult(response, operation) {
+    try {
+      return send(response, 200, await operation());
+    } catch (error) {
+      const refused = ["hidden", "system", "outside"].includes(error.code);
+      const validation = refused || ["validation_error", "folder_missing", "folder_unavailable"].includes(error.code);
+      return send(response, validation ? 422 : 502, { code: refused ? "validation_error" : error.code || "host_operation_failed", error: error.message });
+    }
+  }
+
   async launchMessage(machine, body, request, response) {
     if (request.headers["x-plannotator-window"] !== "1") return send(response, 403, { code: "window_only", error: "Launching an agent requires the Inbox window" });
     const to = body.to?.launch;
-    if (!to || to.agent !== "pi" || typeof to.project_id !== "string" || typeof body.body !== "string" || !body.body.trim()) {
-      return send(response, 422, { code: "validation_error", error: "Launch needs a Pi agent, an existing project, and a message" });
+    const existingProject = typeof to?.project_id === "string";
+    const scratch = to?.scratch === true;
+    const folder = typeof to?.folder === "string" && to.folder.trim() ? to.folder.trim() : null;
+    if (!to || to.agent !== "pi" || (!existingProject && !scratch && !folder) || typeof body.body !== "string" || !body.body.trim()) {
+      return send(response, 422, { code: "validation_error", error: "Launch needs a Pi agent, a project or folder, and a message" });
     }
+    if (to.clone && (!folder || typeof to.clone.url !== "string" || !to.clone.url.trim())) return send(response, 422, { code: "validation_error", error: "Clone needs a repository URL and destination folder" });
     if (Array.isArray(body.uploads) && body.uploads.length) return send(response, 422, { code: "validation_error", error: "Attachments are not supported when launching" });
-    const project = this.launchProjects(machine).find((candidate) => candidate.id === to.project_id);
+    let project;
+    if (existingProject) project = this.launchProjects(machine).find((candidate) => candidate.id === to.project_id);
+    else {
+      if (!this.creationHost(machine, request, response)) return;
+      project = { id: "", name: body.thread_name || (scratch ? "Scratch" : path.basename(folder)), root: folder || "" };
+    }
     if (!project) return send(response, 422, { code: "project_not_found", error: "Project is not available on this host" });
-    const started = await this.startLaunch({ machine, project, body });
+    let started;
+    try {
+      started = await this.startLaunch({ machine, project, body });
+    } catch (error) {
+      const refused = ["hidden", "system", "outside"].includes(error.code);
+      if (refused || ["validation_error", "folder_missing", "folder_unavailable"].includes(error.code)) return send(response, 422, { code: refused ? "validation_error" : error.code, error: error.message });
+      throw error;
+    }
     const { session, launch } = started;
     const key = requireKey(body.idempotency_key);
     let previous = (session.remoteReplies || []).find((message) => message.requestId === key);
@@ -898,6 +944,31 @@ export class VirtualMachines {
     if (route === "threads/archived" && request.method === "GET") return send(response, 200, this.archived(machine, url));
     if (route === "sessions" && request.method === "GET") return send(response, 200, this.sessionList(machine));
     if (route === "search" && request.method === "GET") return send(response, 200, { serverSession: id("srv", machine.hostId), ...this.search(machine, url) });
+    if (route === "launch/folders") {
+      if (request.method !== "GET") return send(response, 405, { error: "Use GET." });
+      const host = this.creationHost(machine, request, response);
+      if (!host) return;
+      return this.creationResult(response, () => this.listFolders({ hostId: host.id, path: url.searchParams.get("path") || "~" }));
+    }
+    if (route === "launch/clone-check") {
+      if (request.method !== "GET") return send(response, 405, { error: "Use GET." });
+      const host = this.creationHost(machine, request, response);
+      if (!host) return;
+      return this.creationResult(response, () => this.cloneCheck({ hostId: host.id, url: url.searchParams.get("url") || "" }));
+    }
+    if (route === "launch/clone") {
+      if (request.method !== "GET") return send(response, 405, { error: "Use GET." });
+      const host = this.creationHost(machine, request, response);
+      if (!host) return;
+      return this.creationResult(response, async () => {
+        const result = await this.cloneTarget({ hostId: host.id, url: url.searchParams.get("url") || "", into: url.searchParams.get("into") || undefined });
+        const target = { ...result };
+        delete target.real;
+        delete target.intoReal;
+        delete target.repo;
+        return target;
+      });
+    }
     if (route === "skills" && request.method === "GET") return send(response, 200, { skills: [] });
     if (route === "skills/content" && request.method === "GET") return send(response, 200, { content: "" });
     if (route === "messages" && request.method === "POST") {

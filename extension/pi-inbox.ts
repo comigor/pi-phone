@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
 import { HostLauncher } from "./host-launch.js";
+import { checkGitRemote, cloneTarget, listFolders } from "./host-folders.js";
 import { chunkSnapshotMessages, snapshotMessages } from "./history-sync.js";
 import { isSubagentSession } from "./session-scope.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -65,7 +66,7 @@ class PiInboxRuntime {
   private pairingCode?: string;
   private latestSnapshot: Snapshot;
   private replyResults = new Map<string, { ok: boolean; error?: string }>();
-  private launcher = new HostLauncher();
+  private launcher = new HostLauncher({ scratchRoot: path.join(stateDirectory(), "scratch") });
   private launchTasks = new Set<Promise<void>>();
 
   constructor(private pi: ExtensionAPI, private ctx: ExtensionContext) {
@@ -155,6 +156,10 @@ class PiInboxRuntime {
       return;
     }
     if (!message || typeof message.type !== "string") return;
+    if (["folder_list", "clone_check", "clone_target"].includes(message.type)) {
+      this.handleCreation(message);
+      return;
+    }
     if (message.type === "launch_start" || message.type === "launch_stop") {
       this.handleLaunch(message);
       return;
@@ -170,7 +175,7 @@ class PiInboxRuntime {
     }
     if (message.type === "paired") {
       this.canSend = true;
-      this.send({ type: "host_hello", launch: { agents: ["pi"], home: os.homedir() } });
+      this.send({ type: "host_hello", launch: { agents: ["pi"], home: os.homedir(), creation: 1 } });
       this.pairingCode = undefined;
       this.setStatus(undefined);
       this.snapshot(this.latestSnapshot.status, true);
@@ -229,14 +234,36 @@ class PiInboxRuntime {
     }
   }
 
-  private handleLaunch(message: { type: string; requestId: string; launchId: string; sessionId: string; cwd?: string; name?: string }) {
+  private handleCreation(message: { type: string; requestId: string; path?: string; url?: string; into?: string }) {
     const task = (async () => {
       try {
-        if (message.type === "launch_start") await this.launcher.start(message.sessionId, message.cwd || os.homedir(), message.name || "Pi session");
-        else await this.launcher.stop(message.sessionId);
-        this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: true });
+        if (message.type === "folder_list") {
+          const listing = await listFolders(os.homedir(), message.path || "~");
+          this.send({ type: "folder_list_result", requestId: message.requestId, ok: true, listing });
+        } else if (message.type === "clone_check") {
+          const reach = await checkGitRemote(message.url || "");
+          this.send({ type: "clone_check_result", requestId: message.requestId, ok: true, reach });
+        } else {
+          const target = await cloneTarget(os.homedir(), message.url || "", message.into);
+          this.send({ type: "clone_target_result", requestId: message.requestId, ok: true, target });
+        }
       } catch (error) {
-        this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: false, error: error instanceof Error ? error.message : "Launch failed" });
+        this.send({ type: `${message.type}_result`, requestId: message.requestId, ok: false, error: error instanceof Error ? error.message : "Host operation failed", code: (error as { code?: string }).code });
+      }
+    })();
+    this.launchTasks.add(task);
+    void task.finally(() => this.launchTasks.delete(task));
+  }
+
+  private handleLaunch(message: { type: string; requestId: string; launchId: string; sessionId: string; cwd?: string; name?: string; arbitrary?: boolean; create?: boolean; scratch?: boolean; clone?: { url: string; branch?: string } }) {
+    const task = (async () => {
+      try {
+        let result;
+        if (message.type === "launch_start") result = await this.launcher.start(message.sessionId, message.cwd || os.homedir(), message.name || "Pi session", { arbitrary: message.arbitrary, create: message.create, scratch: message.scratch, clone: message.clone });
+        else await this.launcher.stop(message.sessionId);
+        this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: true, ...result });
+      } catch (error) {
+        this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: false, error: error instanceof Error ? error.message : "Launch failed", code: (error as { code?: string }).code });
       }
     })();
     this.launchTasks.add(task);
