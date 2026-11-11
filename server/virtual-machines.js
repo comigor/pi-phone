@@ -162,6 +162,7 @@ export class VirtualMachines {
     this.messageCache = new WeakMap();
     this.changeBatches = new Map();
     this.writeQueue = Promise.resolve();
+    this.batches = new Map();
     this.replyFlushes = new Map();
   }
 
@@ -931,6 +932,144 @@ export class VirtualMachines {
     return flush;
   }
 
+  threadIds(value, field) {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > 10_000 || !value.every((threadId) => typeof threadId === "string" && /^msg_[0-9A-HJKMNP-TV-Z]{26}$/.test(threadId))) {
+      throw Object.assign(new Error(`${field}: a list of thread ids (msg_).`), { code: "validation_error" });
+    }
+    return value;
+  }
+
+  async markProjectSessionRead(session) {
+    const latestSeq = Math.max(0, ...this.messagesFor(session).map((message) => message.seq || 0));
+    await this.store.updateVirtualSession(session.key, {
+      readAt: new Date().toISOString(),
+      seenThroughSeq: latestSeq,
+      seenBeforeRead: session.seenThroughSeq ?? 0
+    });
+    await this.changed(session, { row: this.row(session) });
+  }
+
+  async markProjectSessionUnread(session) {
+    await this.store.updateVirtualSession(session.key, {
+      readAt: null,
+      seenThroughSeq: session.seenBeforeRead ?? 0,
+      seenBeforeRead: null,
+      backFromArchive: false
+    });
+    await this.changed(session, { row: this.row(session) });
+  }
+
+  async projectAction(machine, projectId, action, body, response) {
+    try {
+      const sessions = this.sessions(machine).filter((session) => projectFor(session).id === projectId);
+      if (!sessions.length) return send(response, 404, { code: "project_not_found" });
+      if (body.resolved !== undefined && typeof body.resolved !== "boolean") return send(response, 422, { code: "validation_error", error: "resolved must be a boolean" });
+      const batchId = body.batch_id ?? body.idempotency_key ?? null;
+      if (batchId !== null && (typeof batchId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(batchId))) return send(response, 422, { code: "validation_error", error: "batch_id: 1 to 128 letters, digits, _ or -" });
+      const resolved = body.resolved !== false;
+      const route = `${action}:${projectId}:${action === "resolve" ? String(resolved) : ""}`;
+      const replayKey = batchId === null ? null : `${machine.hostId}:${batchId}`;
+      if (replayKey) {
+        const seen = this.batches.get(replayKey);
+        if (seen && seen.route !== route) return send(response, 409, { code: "batch_id_reused", error: "This batch_id answered another request" });
+        if (seen) return send(response, 200, { ...seen.answer, replayed: true }, { "idempotent-replayed": "true" });
+      }
+      const project = () => this.projectRows(sessions).find((item) => item.id === projectId) || null;
+      let answer;
+      if (action === "read") {
+        const read = [];
+        const looked = [];
+        const affected = [];
+        for (const session of sessions.filter((item) => !item.resolvedAt && this.row(item).waiting_on_person)) {
+          const threadId = id("msg", session.key);
+          affected.push(threadId);
+          const latestSeq = Math.max(0, ...this.messagesFor(session).map((message) => message.seq || 0));
+          if (session.readAt && (session.seenThroughSeq ?? 0) >= latestSeq) {
+            looked.push(threadId);
+            continue;
+          }
+          read.push(threadId);
+          await this.markProjectSessionRead(session);
+        }
+        answer = { project: project(), batch: { read, looked }, threads: affected.map((threadId) => this.row(sessions.find((session) => id("msg", session.key) === threadId))) };
+      } else if (action === "unread") {
+        const named = [...this.threadIds(body.threads, "threads"), ...this.threadIds(body.looked, "looked")];
+        const done = [];
+        const skipped = [];
+        for (const threadId of new Set(named)) {
+          const session = sessions.find((item) => id("msg", item.key) === threadId);
+          if (!session) {
+            skipped.push(threadId);
+            continue;
+          }
+          await this.markProjectSessionUnread(session);
+          done.push(this.row(session));
+        }
+        answer = { project: project(), threads: done, skipped };
+      } else if (resolved) {
+        const resolvedIds = [];
+        const read = [];
+        for (const session of sessions.filter((item) => !item.resolvedAt)) {
+          const threadId = id("msg", session.key);
+          if (session.backFromArchive) {
+            read.push(threadId);
+            await this.markProjectSessionRead(session);
+          } else {
+            resolvedIds.push(threadId);
+            await this.store.updateVirtualSession(session.key, { resolvedAt: new Date().toISOString(), backFromArchive: false });
+            await this.changed(session, { row: this.row(session) });
+          }
+        }
+        answer = { project: project(), batch: { resolved: resolvedIds, read }, threads: [...resolvedIds, ...read].map((threadId) => this.row(sessions.find((session) => id("msg", session.key) === threadId))) };
+      } else {
+        if (!body.threads || typeof body.threads !== "object" || Array.isArray(body.threads)) return send(response, 422, { code: "validation_error", error: "threads: { resolved: [ids], read: [ids] }" });
+        const undoResolved = new Set(this.threadIds(body.threads.resolved, "threads.resolved"));
+        const named = [...undoResolved, ...this.threadIds(body.threads.read, "threads.read")];
+        const done = [];
+        const skipped = [];
+        for (const threadId of new Set(named)) {
+          const session = sessions.find((item) => id("msg", item.key) === threadId);
+          if (!session) {
+            skipped.push(threadId);
+            continue;
+          }
+          if (undoResolved.has(threadId)) {
+            await this.store.updateVirtualSession(session.key, { resolvedAt: null, backFromArchive: false });
+            await this.changed(session, { row: this.row(session) });
+          } else await this.markProjectSessionUnread(session);
+          done.push(this.row(session));
+        }
+        answer = { project: project(), threads: done, skipped };
+      }
+      if (replayKey) {
+        this.batches.set(replayKey, { route, answer });
+        if (this.batches.size > 50) this.batches.delete(this.batches.keys().next().value);
+      }
+      return send(response, 200, { ...answer, replayed: false });
+    } catch (error) {
+      if (error.code === "validation_error") return send(response, 422, { code: error.code, error: error.message });
+      throw error;
+    }
+  }
+
+  storeUsage() {
+    return {
+      dir: this.file ? path.dirname(this.file) : "",
+      bytes: Buffer.byteLength(JSON.stringify(this.store.state)),
+      projects: this.projectRows(this.store.state.sessions.filter(hasThreadContent)).length
+    };
+  }
+
+  async deleteThread(machine, threadId, response) {
+    const session = this.session(machine, threadId);
+    if (!session) return send(response, 404, { code: "thread_not_found" });
+    await this.drafts.delete(threadId);
+    await this.store.deleteVirtualSession(session.key);
+    this.threadCache.delete(session.key);
+    await this.changed(session, { thread_id: threadId }, "deletions");
+    return send(response, 200, { ok: true, store: this.storeUsage() });
+  }
   async route(request, response) {
     const url = new URL(request.url, "http://localhost");
     const route = url.pathname.replace("/api/inbox/device/", "");
@@ -1126,27 +1265,12 @@ export class VirtualMachines {
       await this.changed(session);
       return send(response, 200, { message: this.controlMessage(session) });
     }
-    match = route.match(new RegExp("^projects/([^/]+)/resolve$"));
-    if (match && request.method === "POST") {
-      const body = await bodyJson(request);
-      const resolved = body.resolved !== false;
-      const wanted = resolved ? null : new Set(Array.isArray(body.threads?.resolved) ? body.threads.resolved : []);
-      const sessions = this.sessions(machine).filter((session) => projectFor(session).id === match[1] && (!wanted || wanted.has(id("msg", session.key))));
-      if (!sessions.length) return send(response, 404, { code: "project_not_found" });
-      const resolvedAt = resolved ? new Date().toISOString() : null;
-      const changedSessions = sessions.filter((session) => Boolean(session.resolvedAt) !== resolved);
-      for (const session of changedSessions) {
-        await this.store.updateVirtualSession(session.key, { resolvedAt, backFromArchive: false });
-        await this.changed(session, { row: this.row(session) });
-      }
-      if (!resolved) return send(response, 200, { threads: changedSessions.map((session) => this.row(session)), skipped: [] });
-      return send(response, 200, {
-        project: this.projectRows(sessions)[0] || null,
-        batch: { resolved: changedSessions.map((session) => id("msg", session.key)), read: [] },
-        threads: changedSessions.map((session) => this.row(session)),
-        replayed: false
-      });
-    }
+    match = route.match(new RegExp("^projects/([^/]+)/(read|unread|resolve)$"));
+    if (match && request.method === "POST") return this.projectAction(machine, match[1], match[2], await bodyJson(request), response);
+
+    match = route.match(new RegExp("^threads/([^/]+)/delete$"));
+    if (match && request.method === "POST") return this.deleteThread(machine, match[1], response);
+
 
     match = route.match(new RegExp("^messages/([^/]+)/resolve$"));
     if (match && request.method === "POST") {

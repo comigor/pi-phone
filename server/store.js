@@ -24,7 +24,7 @@ export class InboxStore {
     this.stateFile = path.join(dataDir, "state.json");
     this.writeVersion = 0;
     this.writtenVersion = 0;
-    this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [], launchIdempotency: [] };
+    this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [], launchIdempotency: [], deletedSessions: [] };
     this.sessionChanges = new Map();
   }
 
@@ -37,6 +37,7 @@ export class InboxStore {
       if (error.code !== "ENOENT") throw error;
     }
     this.state.launchIdempotency = Array.isArray(this.state.launchIdempotency) ? this.state.launchIdempotency : [];
+    this.state.deletedSessions = Array.isArray(this.state.deletedSessions) ? this.state.deletedSessions : [];
     for (const host of this.state.hosts) host.online = false;
     for (const session of this.state.sessions) {
       session.online = false;
@@ -282,6 +283,23 @@ export class InboxStore {
     this.state.launchIdempotency.push({ ...entry, createdAt: new Date().toISOString() });
     if (this.state.launchIdempotency.length > 256) this.state.launchIdempotency.splice(0, this.state.launchIdempotency.length - 256);
     await this.persist();
+  }
+
+  isSessionDeleted(key) {
+    return this.state.deletedSessions.includes(key);
+  }
+
+  async deleteVirtualSession(key) {
+    const index = this.state.sessions.findIndex((session) => session.key === key);
+    if (index < 0) return false;
+    this.state.sessions.splice(index, 1);
+    this.state.inbox = this.state.inbox.filter((item) => item.sessionKey !== key);
+    this.state.launchIdempotency = this.state.launchIdempotency.filter((item) => item.sessionKey !== key);
+    if (!this.state.deletedSessions.includes(key)) this.state.deletedSessions.push(key);
+    if (this.state.deletedSessions.length > 1000) this.state.deletedSessions.splice(0, this.state.deletedSessions.length - 1000);
+    this.sessionChanges.delete(key);
+    await this.persist();
+    return true;
   }
 
   async addInbox({ hostId, session, runId, kind, title, body }) {
