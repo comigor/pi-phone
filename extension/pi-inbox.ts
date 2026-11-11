@@ -370,9 +370,9 @@ class PiInboxRuntime {
 export default function (pi: ExtensionAPI) {
   let runtime: PiInboxRuntime | undefined;
   pi.on("session_start", async (_event, ctx) => {
+    // Native OMP children reuse this process; leave the parent runtime intact.
+    if (isSubagentSession(process.env, ctx.sessionManager.getSessionFile())) return;
     runtime?.dispose();
-    runtime = undefined;
-    if (isSubagentSession()) return;
     runtime = new PiInboxRuntime(pi, ctx);
     await runtime.start();
   });
