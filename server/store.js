@@ -24,7 +24,7 @@ export class InboxStore {
     this.stateFile = path.join(dataDir, "state.json");
     this.writeVersion = 0;
     this.writtenVersion = 0;
-    this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [] };
+    this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [], launchIdempotency: [] };
     this.sessionChanges = new Map();
   }
 
@@ -36,6 +36,7 @@ export class InboxStore {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    this.state.launchIdempotency = Array.isArray(this.state.launchIdempotency) ? this.state.launchIdempotency : [];
     for (const host of this.state.hosts) host.online = false;
     for (const session of this.state.sessions) {
       session.online = false;
@@ -270,6 +271,17 @@ export class InboxStore {
     session.virtualCursor = (session.virtualCursor ?? 0) + 1;
     await this.persist();
     return session;
+  }
+
+  getLaunchIdempotency(hostId, key) {
+    return this.state.launchIdempotency.find((entry) => entry.hostId === hostId && entry.key === key);
+  }
+
+  async recordLaunchIdempotency(entry) {
+    this.state.launchIdempotency = this.state.launchIdempotency.filter((item) => !(item.hostId === entry.hostId && item.key === entry.key));
+    this.state.launchIdempotency.push({ ...entry, createdAt: new Date().toISOString() });
+    if (this.state.launchIdempotency.length > 256) this.state.launchIdempotency.splice(0, this.state.launchIdempotency.length - 256);
+    await this.persist();
   }
 
   async addInbox({ hostId, session, runId, kind, title, body }) {

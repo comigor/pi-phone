@@ -143,6 +143,9 @@ export class VirtualMachines {
     this.stopSession = options.stopSession;
     this.startLaunch = options.startLaunch;
     this.stopLaunch = options.stopLaunch;
+    this.retryLaunch = options.retryLaunch;
+    this.trustLaunch = options.trustLaunch;
+    this.deleteLaunch = options.deleteLaunch;
     this.listFolders = options.listFolders;
     this.cloneCheck = options.cloneCheck;
     this.cloneTarget = options.cloneTarget;
@@ -444,19 +447,20 @@ export class VirtualMachines {
   }
 
   run(session) {
-    if (!session.launch) return null;
+    if (!session.launch || session.launch.deleted_at) return null;
     const stopped = Boolean(session.launchStoppedAt) || !session.online;
+    const failed = Boolean(session.launch.error);
     return {
-      state: stopped ? "stopped" : session.status === "running" ? "working" : "waiting_answer",
+      state: failed ? "failed" : stopped ? "stopped" : session.status === "running" ? "working" : "waiting_answer",
       launch_id: session.launch.id,
       agent: "pi",
       project: projectFor(session).name,
       folder: session.launch.folder,
       since: session.launchStoppedAt || activityAt(session),
-      again: false,
+      again: failed || stopped,
       stopped_by_person: Boolean(session.launchStoppedAt),
-      cause: null,
-      untrusted: false,
+      cause: session.launch.error?.text || null,
+      untrusted: session.launch.untrusted === true,
       attach_command: null
     };
   }
@@ -1082,14 +1086,28 @@ export class VirtualMachines {
       await this.changed(session);
       return send(response, 200, { thread: this.row(session) });
     }
-    match = route.match(new RegExp("^launch/([^/]+)/stop$"));
+    match = route.match(new RegExp("^launch/([^/]+)/(stop|retry|trust|delete)$"));
     if (match && request.method === "POST") {
-      if (request.headers["x-plannotator-window"] !== "1") return send(response, 403, { code: "window_only", error: "Stopping an agent requires the Inbox window" });
+      const action = match[2];
+      if (request.headers["x-plannotator-window"] !== "1") return send(response, 403, { code: "window_only", error: "Launch lifecycle actions require the Inbox window" });
       const session = this.sessions(machine).find((item) => item.launch?.id === match[1]);
-      if (!session) return send(response, 404, { code: "launch_not_found" });
-      await this.stopLaunch(session);
-      await this.changed(session);
-      return send(response, 200, { run: this.run(session) });
+      if (!session || (session.launch.deleted_at && action !== "delete")) return send(response, 404, { code: "launch_not_found" });
+      const alreadyDeleted = Boolean(session.launch.deleted_at);
+      try {
+        if (action === "stop") await this.stopLaunch(session);
+        else if (action === "retry") await this.retryLaunch(session);
+        else if (action === "trust") await this.trustLaunch(session);
+        else {
+          const result = await this.deleteLaunch(session);
+          if (!alreadyDeleted) await this.changed(session);
+          return send(response, 200, { ok: true, ...result });
+        }
+        await this.changed(session);
+        return send(response, 200, { run: this.run(session) });
+      } catch (error) {
+        const status = error.code === "validation_error" ? 422 : error.code === "launch_not_found" ? 404 : 400;
+        return send(response, status, { code: error.code || "launch_failed", error: error.message });
+      }
     }
     match = route.match(new RegExp("^messages/([^/]+)/reply$"));
     if (match && request.method === "POST") {

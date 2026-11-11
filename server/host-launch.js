@@ -16,6 +16,7 @@ export class HostLaunchCoordinator {
     this.pending = new Map();
     this.requests = new Map();
     this.idempotency = new Map();
+    this.deleting = new Map();
     this.waiters = new Map();
     this.capable = new WeakSet();
     this.creationCapable = new WeakSet();
@@ -118,16 +119,21 @@ export class HostLaunchCoordinator {
   }
 
   async start({ machine, project, body }) {
-    const key = body.idempotency_key;
-    const existing = this.idempotency.get(key);
+    const scopedKey = `${machine.hostId}:${body.idempotency_key}`;
+    const existing = this.idempotency.get(scopedKey);
     if (existing) return { ...await existing, replayed: true };
+    const persisted = this.store.getLaunchIdempotency(machine.hostId, body.idempotency_key);
+    if (persisted) {
+      const session = this.store.getSession(persisted.sessionKey);
+      if (session?.launch?.id === persisted.launchId) return { session, launch: session.launch, replayed: true };
+    }
     const promise = this.performStart({ machine, project, body });
-    this.idempotency.set(key, promise);
+    this.idempotency.set(scopedKey, promise);
     if (this.idempotency.size > 256) this.idempotency.delete(this.idempotency.keys().next().value);
     try {
       return await promise;
     } catch (error) {
-      this.idempotency.delete(key);
+      this.idempotency.delete(scopedKey);
       throw error;
     }
   }
@@ -179,6 +185,7 @@ export class HostLaunchCoordinator {
       pending.cwd = launch.folder;
       const session = await registered;
       await this.store.updateVirtualSession(session.key, { launch, launchStoppedAt: null });
+      await this.store.recordLaunchIdempotency({ hostId, key: body.idempotency_key, sessionKey: session.key, launchId: launch.id });
       return { session, launch, replayed: false };
     } catch (error) {
       this.pending.delete(launch.id);
@@ -188,13 +195,49 @@ export class HostLaunchCoordinator {
 
   async stop(session) {
     const launch = session.launch;
+    if (launch.deleted_at) return launch;
     await this.requestHost(session.hostId, { type: "launch_stop", requestId: randomUUID(), launchId: launch.id, sessionId: session.sessionId });
     await this.store.updateVirtualSession(session.key, { launchStoppedAt: new Date().toISOString() });
     return launch;
   }
 
+  async retry(session) {
+    if (session.launch.deleted_at) throw Object.assign(new Error("That launch was deleted."), { code: "launch_not_found" });
+    if (session.online && !session.launchStoppedAt && !session.launch.error) throw Object.assign(new Error("That launch did not fail."), { code: "validation_error" });
+    await this.store.updateVirtualSession(session.key, { launch: { ...session.launch, error: null } });
+    await this.ensureOnline(session);
+    return session.launch;
+  }
+
+  async trust(session) {
+    if (session.launch.deleted_at) throw Object.assign(new Error("That launch was deleted."), { code: "launch_not_found" });
+    const retry = session.launch.untrusted === true;
+    await this.store.updateVirtualSession(session.key, { launch: { ...session.launch, trusted_at: new Date().toISOString(), untrusted: false, error: null } });
+    if (retry) await this.ensureOnline(session);
+    return session.launch;
+  }
+
+  async delete(session) {
+    if (session.launch.deleted_at) return {};
+    const existing = this.deleting.get(session.launch.id);
+    if (existing) return existing;
+    const promise = (async () => {
+      const result = await this.requestHost(session.hostId, { type: "launch_delete", requestId: randomUUID(), launchId: session.launch.id, sessionId: session.sessionId, cwd: session.launch.folder, scratch: session.launch.scratch === true });
+      const launch = { ...session.launch, deleted_at: new Date().toISOString() };
+      await this.store.updateVirtualSession(session.key, { launch, launchStoppedAt: new Date().toISOString() });
+      return session.launch.scratch ? { scratch_removed: result.scratch_removed } : {};
+    })();
+    this.deleting.set(session.launch.id, promise);
+    try {
+      return await promise;
+    } finally {
+      this.deleting.delete(session.launch.id);
+    }
+  }
+
   async ensureOnline(session) {
     if (!session?.launch) return;
+    if (session.launch.deleted_at) throw Object.assign(new Error("That launch was deleted."), { code: "launch_not_found" });
     if (!session.launchStoppedAt && session.online && this.sessionAgents.has(session.key)) return;
     if (this.hasPending(session.hostId, session.sessionId)) return this.waitForSession(session.key);
     const pending = { hostId: session.hostId, sessionId: session.sessionId, launch: session.launch, cwd: session.launch.folder, name: session.name };

@@ -103,6 +103,9 @@ export class InboxHub {
       stopSession: (input) => hub.stopSession(input),
       startLaunch: (input) => hub.launch.start(input),
       stopLaunch: (session) => hub.launch.stop(session),
+      retryLaunch: (session) => hub.launch.retry(session),
+      trustLaunch: (session) => hub.launch.trust(session),
+      deleteLaunch: (session) => hub.launch.delete(session),
       listFolders: (input) => hub.launch.listFolders(input.hostId, input.path),
       cloneCheck: (input) => hub.launch.cloneCheck(input.hostId, input.url),
       cloneTarget: (input) => hub.launch.cloneTarget(input.hostId, input.url, input.into)

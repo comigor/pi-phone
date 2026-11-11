@@ -129,4 +129,13 @@ test("host launcher creates one-level folders and scratch directories", async (t
   });
   const launches = lines.trim().split("\n").map(JSON.parse);
   assert.deepEqual(new Set(launches.map((launch) => launch.cwd)), new Set([created.cwd, scratch.cwd]));
+  const outside = await launcher.delete("missing", projects, true);
+  assert.equal(outside.scratch_removed, false);
+  await access(projects);
+  const removed = await launcher.delete("scratch-session", scratch.cwd, true);
+  assert.equal(removed.scratch_removed, true);
+  await assert.rejects(access(scratch.cwd));
+  const kept = await launcher.delete("created-session", created.cwd, false);
+  assert.equal(kept.scratch_removed, false);
+  await access(created.cwd);
 });
