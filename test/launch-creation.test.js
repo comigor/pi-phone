@@ -191,10 +191,13 @@ test("official folder and clone APIs drive prepared Pi launches", async (t) => {
   assert.equal(retried.run.state, "waiting_answer");
   assert.equal(retried.run.launch_id, scratch.launch.id);
 
+  const healthyRetry = await request(`/launch/${scratch.launch.id}/retry`, { method: "POST", body: "{}" });
+  assert.equal(healthyRetry.status, 422);
+  assert.equal((await healthyRetry.json()).code, "validation_error");
   const trustedResponse = await request(`/launch/${scratch.launch.id}/trust`, { method: "POST", body: "{}" });
   assert.equal(trustedResponse.status, 200);
   assert.equal((await trustedResponse.json()).run.untrusted, false);
-  assert.ok(hub.store.getSession(replay.session.key).launch.trusted_at);
+  assert.equal(hub.store.getSession(replay.session.key).launch.trusted_at, undefined);
 
   const deleteRequest = nextMessage(agent, "launch_delete");
   const deleteResponsePromise = request(`/launch/${scratch.launch.id}/delete`, { method: "POST", body: "{}" });
