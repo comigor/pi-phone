@@ -6,6 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
 import { InboxHub } from "../server/index.js";
+import { HostLaunchCoordinator } from "../server/host-launch.js";
+import { InboxStore } from "../server/store.js";
 import { agentSignaturePayload } from "../server/protocol.js";
 
 function identity() {
@@ -153,4 +155,58 @@ test("official folder and clone APIs drive prepared Pi launches", async (t) => {
   });
   assert.deepEqual(cloned.message.launch.clone, { url: "https://github.com/acme/widget.git", state: "cloned" });
   assert.equal(cloned.message.launch.folder, "/Users/igor/Projects/widget");
+
+  await hub.store.flush();
+  const restoredStore = new InboxStore(temporary);
+  await restoredStore.load();
+  const restoredLaunch = new HostLaunchCoordinator({ store: restoredStore, agents: new Map(), sessionAgents: new Map() });
+  const replay = await restoredLaunch.start({
+    machine: { hostId: agentIdentity.hostId }, project: { name: "Research", root: "" },
+    body: { idempotency_key: "scratch-launch", body: "Prompt for scratch-launch", thread_name: "Research", to: { launch: { agent: "pi", scratch: true } } }
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.launch.id, scratch.message.launch.id);
+  assert.equal(replay.session.key, `${agentIdentity.hostId}:${scratch.message.launch.session_ref}`);
+
+  const stopRequest = nextMessage(agent, "launch_stop");
+  const stopResponsePromise = request(`/launch/${scratch.launch.id}/stop`, { method: "POST", body: "{}" });
+  const stop = await stopRequest;
+  agent.send(JSON.stringify({ type: "launch_result", requestId: stop.requestId, launchId: stop.launchId, sessionId: stop.sessionId, ok: true }));
+  const stopped = await (await stopResponsePromise).json();
+  assert.equal(stopped.run.state, "stopped");
+  assert.equal(stopped.run.again, true);
+
+  const retryRequest = nextMessage(agent, "launch_start");
+  const retryResponsePromise = request(`/launch/${scratch.launch.id}/retry`, { method: "POST", body: "{}" });
+  const retry = await retryRequest;
+  assert.equal(retry.sessionId, scratch.message.launch.session_ref);
+  assert.equal(retry.cwd, scratch.message.launch.folder);
+  assert.notEqual(retry.scratch, true);
+  agent.send(JSON.stringify({ type: "launch_result", requestId: retry.requestId, launchId: retry.launchId, sessionId: retry.sessionId, ok: true, cwd: retry.cwd, scratch: true }));
+  const retryChild = await connectAgent(hub.addresses().agent, agentIdentity);
+  children.push(retryChild);
+  const retryGeneration = randomUUID();
+  retryChild.send(JSON.stringify({ type: "session_upsert", sessionId: retry.sessionId, generation: retryGeneration, session: { sessionId: retry.sessionId, generation: retryGeneration, cwd: retry.cwd, name: "Research", status: "idle", messages: [] } }));
+  const retried = await (await retryResponsePromise).json();
+  assert.equal(retried.run.state, "waiting_answer");
+  assert.equal(retried.run.launch_id, scratch.launch.id);
+
+  const trustedResponse = await request(`/launch/${scratch.launch.id}/trust`, { method: "POST", body: "{}" });
+  assert.equal(trustedResponse.status, 200);
+  assert.equal((await trustedResponse.json()).run.untrusted, false);
+  assert.ok(hub.store.getSession(replay.session.key).launch.trusted_at);
+
+  const deleteRequest = nextMessage(agent, "launch_delete");
+  const deleteResponsePromise = request(`/launch/${scratch.launch.id}/delete`, { method: "POST", body: "{}" });
+  const deletion = await deleteRequest;
+  assert.equal(deletion.cwd, scratch.message.launch.folder);
+  assert.equal(deletion.scratch, true);
+  agent.send(JSON.stringify({ type: "launch_result", requestId: deletion.requestId, launchId: deletion.launchId, sessionId: deletion.sessionId, ok: true, scratch_removed: true }));
+  const deletedResponse = await deleteResponsePromise;
+  assert.equal(deletedResponse.status, 200);
+  assert.deepEqual(await deletedResponse.json(), { ok: true, scratch_removed: true });
+  assert.ok(hub.store.getSession(replay.session.key).launch.deleted_at);
+  assert.equal((await (await request(`/threads/${scratch.thread_id}`)).json()).run, null);
+  assert.deepEqual(await (await request(`/launch/${scratch.launch.id}/delete`, { method: "POST", body: "{}" })).json(), { ok: true });
+  assert.equal((await request(`/launch/${scratch.launch.id}/retry`, { method: "POST", body: "{}" })).status, 404);
 });

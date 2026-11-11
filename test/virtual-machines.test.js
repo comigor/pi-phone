@@ -800,6 +800,40 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const scratchLaunched = await scratchResponse.json();
   assert.equal(scratchLaunched.message.launch.scratch, true);
   assert.equal(scratchLaunched.message.launch.folder, "/workspace/scratch");
+  const retryRequest = nextMessage(agent, "launch_start");
+  const retryResponsePromise = fetch(`${forwardedBase}/launch/${launched.launch.id}/retry`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central, "x-plannotator-window": "1" },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "upstream-retry-contract" })
+  });
+  const retryStart = await retryRequest;
+  assert.equal(retryStart.sessionId, launchStart.sessionId);
+  assert.equal(retryStart.cwd, "/workspace/contract");
+  agent.send(JSON.stringify({ type: "launch_result", requestId: retryStart.requestId, launchId: retryStart.launchId, sessionId: retryStart.sessionId, ok: true, cwd: "/workspace/contract" }));
+  const retryGeneration = randomUUID();
+  child.send(JSON.stringify({ type: "session_upsert", sessionId: launchStart.sessionId, generation: retryGeneration, session: { sessionId: launchStart.sessionId, generation: retryGeneration, cwd: "/workspace/contract", name: "Central launch", model: "test/model", status: "idle", messages: [] } }));
+  const retryResponse = await retryResponsePromise;
+  assert.equal(retryResponse.status, 200);
+  assert.equal((await retryResponse.json()).run.state, "waiting_answer");
+
+  const trustResponse = await fetch(`${forwardedBase}/launch/${launched.launch.id}/trust`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central, "x-plannotator-window": "1" },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "upstream-trust-contract", warning: null })
+  });
+  assert.equal(trustResponse.status, 200);
+  assert.equal((await trustResponse.json()).run.untrusted, false);
+
+  const deleteRequest = nextMessage(agent, "launch_delete");
+  const deleteResponsePromise = fetch(`${forwardedBase}/launch/${scratchLaunched.launch.id}/delete`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central, "x-plannotator-window": "1" },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "upstream-delete-contract" })
+  });
+  const deletion = await deleteRequest;
+  assert.equal(deletion.cwd, "/workspace/scratch");
+  agent.send(JSON.stringify({ type: "launch_result", requestId: deletion.requestId, launchId: deletion.launchId, sessionId: deletion.sessionId, ok: true, scratch_removed: true }));
+  const deleteResponse = await deleteResponsePromise;
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(await deleteResponse.json(), { ok: true, scratch_removed: true });
+  assert.equal((await (await fetch(`${forwardedBase}/threads/${scratchLaunched.thread_id}`)).json()).run, null);
   scratchChild.close();
   child.close();
 

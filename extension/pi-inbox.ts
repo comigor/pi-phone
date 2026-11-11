@@ -160,7 +160,7 @@ class PiInboxRuntime {
       this.handleCreation(message);
       return;
     }
-    if (message.type === "launch_start" || message.type === "launch_stop") {
+    if (["launch_start", "launch_stop", "launch_delete"].includes(message.type)) {
       this.handleLaunch(message);
       return;
     }
@@ -260,6 +260,7 @@ class PiInboxRuntime {
       try {
         let result;
         if (message.type === "launch_start") result = await this.launcher.start(message.sessionId, message.cwd || os.homedir(), message.name || "Pi session", { arbitrary: message.arbitrary, create: message.create, scratch: message.scratch, clone: message.clone });
+        else if (message.type === "launch_delete") result = await this.launcher.delete(message.sessionId, message.cwd || "", message.scratch === true);
         else await this.launcher.stop(message.sessionId);
         this.send({ type: "launch_result", requestId: message.requestId, launchId: message.launchId, sessionId: message.sessionId, ok: true, ...result });
       } catch (error) {

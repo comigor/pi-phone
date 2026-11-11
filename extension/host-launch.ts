@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { realpath, rm } from "node:fs/promises";
 import { cloneRepository, listFolders, makeScratch, parseGitRepo, prepareFolder, type GitRepo } from "./host-folders.js";
 
 export interface HostLaunchOptions {
@@ -78,6 +79,20 @@ export class HostLauncher {
     timer.unref();
     await exited;
     clearTimeout(timer);
+  }
+
+  async delete(sessionId: string, folder: string, scratch: boolean): Promise<{ scratch_removed: boolean }> {
+    await this.stop(sessionId);
+    if (!scratch) return { scratch_removed: false };
+    try {
+      const root = await realpath(this.scratchRoot);
+      const candidate = await realpath(folder);
+      if (path.dirname(candidate) !== root) return { scratch_removed: false };
+      await rm(candidate, { recursive: true, force: false });
+      return { scratch_removed: true };
+    } catch {
+      return { scratch_removed: false };
+    }
   }
 
   async close(): Promise<void> {
