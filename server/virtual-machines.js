@@ -149,6 +149,8 @@ export class VirtualMachines {
     this.listFolders = options.listFolders;
     this.cloneCheck = options.cloneCheck;
     this.cloneTarget = options.cloneTarget;
+    this.listSkills = options.listSkills;
+    this.readSkillContent = options.readSkillContent;
     this.linkMachine = options.linkMachine;
     this.publicAddress = options.publicAddress;
     this.file = path.join(options.dataDir, "virtual-machines.json");
@@ -1112,8 +1114,14 @@ export class VirtualMachines {
         return target;
       });
     }
-    if (route === "skills" && request.method === "GET") return send(response, 200, { skills: [] });
-    if (route === "skills/content" && request.method === "GET") return send(response, 200, { content: "" });
+    if (["skills", "skills/content"].includes(route) && request.method === "GET") {
+      const host = this.store.getHost(machine.hostId);
+      if (!host?.online) return send(response, 503, { code: "machine_offline", error: "Host is offline" });
+      if (host.skills !== 1) return send(response, 409, { code: "agent_unavailable", error: "Host skills are unavailable" });
+      if (route === "skills") return this.creationResult(response, async () => ({ skills: await this.listSkills({ hostId: host.id }) }));
+      const skill = await this.readSkillContent({ hostId: host.id, name: url.searchParams.get("name") || "" });
+      return skill ? send(response, 200, { skill }) : send(response, 404, { code: "skill_not_found", error: "Skill not found" });
+    }
     if (route === "messages" && request.method === "POST") {
       const body = await bodyJson(request);
       if (body.to?.launch) return this.launchMessage(machine, body, request, response);

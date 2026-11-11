@@ -20,6 +20,7 @@ export class HostLaunchCoordinator {
     this.waiters = new Map();
     this.capable = new WeakSet();
     this.creationCapable = new WeakSet();
+    this.skillsCapable = new WeakSet();
   }
 
   async hello(host, message, socket) {
@@ -28,6 +29,9 @@ export class HostLaunchCoordinator {
     else this.capable.delete(socket);
     if (agents.length && message.launch.creation === 1) this.creationCapable.add(socket);
     else this.creationCapable.delete(socket);
+    if (message.skills === 1) this.skillsCapable.add(socket);
+    else this.skillsCapable.delete(socket);
+    host.skills = message.skills === 1 ? 1 : 0;
     host.launch = agents.length ? { agents, home: typeof message.launch.home === "string" ? message.launch.home : "/", creation: message.launch.creation === 1 ? 1 : 0 } : null;
     await this.store.persist();
   }
@@ -37,6 +41,8 @@ export class HostLaunchCoordinator {
     const open = [...(this.agents.get(host.id) || [])].filter((candidate) => candidate.readyState === WebSocket.OPEN);
     const capable = open.some((candidate) => this.capable.has(candidate));
     const creation = open.some((candidate) => this.creationCapable.has(candidate));
+    const skills = open.some((candidate) => this.skillsCapable.has(candidate));
+    host.skills = skills ? 1 : 0;
     if (!capable && host.launch) host.launch = null;
     else if (host.launch) host.launch = { ...host.launch, creation: creation ? 1 : 0 };
     await this.store.persist();
@@ -74,9 +80,9 @@ export class HostLaunchCoordinator {
     }
   }
 
-  requestHost(hostId, message, { timeoutMs = 15_000, creation = false } = {}) {
-    const socket = [...(this.agents.get(hostId) || [])].find((candidate) => this.capable.has(candidate) && (!creation || this.creationCapable.has(candidate)) && candidate.readyState === WebSocket.OPEN);
-    if (!socket) return Promise.reject(new Error(creation ? "Host launch creation is unavailable" : "Host is offline"));
+  requestHost(hostId, message, { timeoutMs = 15_000, creation = false, skills = false } = {}) {
+    const socket = [...(this.agents.get(hostId) || [])].find((candidate) => this.capable.has(candidate) && (!creation || this.creationCapable.has(candidate)) && (!skills || this.skillsCapable.has(candidate)) && candidate.readyState === WebSocket.OPEN);
+    if (!socket) return Promise.reject(new Error(creation ? "Host launch creation is unavailable" : skills ? "Host skills are unavailable" : "Host is offline"));
     const waiter = deferred();
     const timeout = setTimeout(() => {
       this.requests.delete(message.requestId);
@@ -86,6 +92,16 @@ export class HostLaunchCoordinator {
     this.requests.set(message.requestId, { ...waiter, timeout });
     socket.send(JSON.stringify(message));
     return waiter.promise;
+  }
+
+  async listSkills(hostId) {
+    const result = await this.requestHost(hostId, { type: "skill_list", requestId: randomUUID() }, { skills: true });
+    return result.skills;
+  }
+
+  async readSkillContent(hostId, name) {
+    const result = await this.requestHost(hostId, { type: "skill_content", requestId: randomUUID(), name }, { skills: true });
+    return result.skill;
   }
 
   async listFolders(hostId, path) {
