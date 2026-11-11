@@ -258,7 +258,15 @@ export class InboxHub {
         this.broadcastState();
       }
       this.broadcast({ type: message.type === "session_patch" ? "session_patch" : "session", session });
-      await this.virtual.changed(session);
+      const change = this.store.sessionChange(key);
+      if (change.message) {
+        const messages = this.virtual.sourceMessagesFor(session);
+        const index = messages.length - 1;
+        const record = index >= 0 ? { message: this.virtual.cachedVirtualMessage(session, messages[index], index) } : {};
+        await this.virtual.changed(session, record);
+      } else if (change.presentation) {
+        await this.virtual.changed(session, { sessions: true, agents: true }, "deliveries");
+      }
       return;
     }
     const session = this.store.getSession(key);

@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { paginateSearchAnswer, searchVirtualSessions } from "./search.js";
+import { isVisibleMessage } from "./visible-messages.js";
 
 const ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
@@ -20,10 +21,8 @@ function id(prefix, ...parts) {
   return result;
 }
 
-function isVisibleMessage(message) {
-  if (message.role === "user") return true;
-  if (message.role !== "assistant" || message.stopReason === "toolUse" || message.toolCalls?.length) return false;
-  return Boolean(message.text || message.errorMessage || message.images?.length || message.attachments?.length);
+function activityAt(session) {
+  return session.visibleUpdatedAt || session.updatedAt;
 }
 
 function hasThreadContent(session) {
@@ -356,7 +355,7 @@ export class VirtualMachines {
       author: { kind: "agent", host: "pi", session: session.sessionId, name: "Pi" },
       subject: "Session controls",
       body: running ? ":::question\nThe agent is running.\n\n- [ ] Stop agent\n:::" : "The agent is idle.",
-      created_at: session.updatedAt,
+      created_at: activityAt(session),
       resolved_at: null,
       idempotency_key: null,
       thread_name: null,
@@ -415,7 +414,7 @@ export class VirtualMachines {
       subject: session.name || project.name,
       author: { kind: "agent", host: "pi", session: session.sessionId, name: "Pi" },
       created_at: session.createdAt || session.updatedAt,
-      last_at: session.updatedAt,
+      last_at: activityAt(session),
       last_author: last?.author.kind || "agent",
       message_count: messageCount,
       resolved_at: session.resolvedAt || null,
@@ -431,11 +430,11 @@ export class VirtualMachines {
       thread_name: null,
       answered_not_sent: false,
       reask_pending: false,
-      waiting_since: waiting ? session.updatedAt : null,
+      waiting_since: waiting ? activityAt(session) : null,
       unseen,
       sent: null,
       guide: false,
-      last_agent_at: session.updatedAt,
+      last_agent_at: activityAt(session),
       section: waiting ? "waiting" : "sent",
       unread: !session.readAt || unseen > 0
     };
@@ -450,7 +449,7 @@ export class VirtualMachines {
       agent: "pi",
       project: projectFor(session).name,
       folder: session.launch.folder,
-      since: session.launchStoppedAt || session.updatedAt,
+      since: session.launchStoppedAt || activityAt(session),
       again: false,
       stopped_by_person: Boolean(session.launchStoppedAt),
       cause: null,

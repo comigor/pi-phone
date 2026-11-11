@@ -429,3 +429,58 @@ test("replies follow the current generation and offline delivery is retryable", 
   assert.equal((await offline.json()).outbox.key, "offline-reply");
   assert.equal(hub.store.getSession(sessionKey).pendingReplies[0].text, "Send later");
 });
+
+test("tool-only patches do not emit new-message records", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-inbox-tool-notifications-"));
+  const hub = await InboxHub.create({ dataDir, publicDir: path.resolve("public"), publicUrl: "http://localhost" });
+  await hub.listen({ viewerPort: 0, agentPort: 0, doorPort: 0, host: "127.0.0.1" });
+  const addresses = hub.addresses();
+  const agentIdentity = identity();
+  const agent = await connectAgent(addresses.agent, agentIdentity);
+  t.after(async () => {
+    agent.socket.terminate();
+    await hub.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await agent.next((message) => message.type === "pairing_required");
+  await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
+  await agent.next((message) => message.type === "paired");
+  const events = [];
+  hub.virtual.changed = (_session, _record, event = "record") => {
+    events.push({ event, body: _record?.message?.body });
+    return Promise.resolve();
+  };
+  const sessionId = randomUUID();
+  const generation = randomUUID();
+  const key = `${agentIdentity.hostId}:${sessionId}`;
+  const patch = (type, messages) => agent.socket.send(JSON.stringify({
+    type, sessionId, generation,
+    session: { sessionId, generation, cwd: "/workspace", name: "notifications", status: "running", messages }
+  }));
+  patch("session_upsert", [{ id: "question", role: "user", text: "Start" }]);
+  const until = async (predicate) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail("Timed out waiting for session update");
+  };
+  await until(() => events.length === 1);
+  assert.equal(events[0].event, "record");
+  const lastAt = hub.virtual.row(hub.store.getSession(key)).last_at;
+  patch("session_patch", [{ id: "working", role: "assistant", text: "Working", toolCalls: [{ name: "bash", arguments: {} }], stopReason: "toolUse" }]);
+  await until(() => hub.store.getSession(key).messages.some((message) => message.id === "working"));
+  patch("session_patch", [{ id: "result", role: "toolResult", text: "Raw output" }]);
+  await until(() => hub.store.getSession(key).messages.some((message) => message.id === "result"));
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(events.length, 1);
+  assert.equal(hub.virtual.row(hub.store.getSession(key)).last_at, lastAt);
+  patch("session_patch", [{ id: "answer", role: "assistant", text: "Final response", toolCalls: [], stopReason: "stop" }]);
+  await until(() => events.length === 2);
+  assert.equal(events[1].event, "record");
+  assert.equal(events[1].body, "Final response");
+  agent.socket.send(JSON.stringify({ type: "session_patch", sessionId, generation, session: { sessionId, generation, cwd: "/workspace", name: "notifications", status: "idle", messages: [] } }));
+  await until(() => events.length === 3);
+  assert.equal(events[2].event, "deliveries");
+});
+
