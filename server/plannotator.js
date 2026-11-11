@@ -58,7 +58,7 @@ export class PlannotatorRuntime {
     await this.run(["inbox", "stop"]).catch(() => undefined);
   }
 
-  proxy(request, response) {
+  proxy(request, response, onStream) {
     if (!this.url) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "Plannotator is not ready" }));
@@ -90,10 +90,12 @@ export class PlannotatorRuntime {
         delete responseHeaders["content-length"];
         delete responseHeaders.etag;
         response.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
+        onStream?.(response);
         upstreamResponse.pipe(createGzip()).pipe(response);
         return;
       }
       response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+      onStream?.(response);
       upstreamResponse.pipe(response);
     });
     upstream.on("error", (error) => {

@@ -70,6 +70,7 @@ export class InboxHub {
     this.sessionAgents = new Map();
     this.agentClosures = new Map();
     this.viewers = new Set();
+    this.pinListeners = new Set();
     this.challenges = new Map();
     this.pendingReplies = new Map();
     this.launch = new HostLaunchCoordinator({ store: this.store, agents: this.agents, sessionAgents: this.sessionAgents });
@@ -446,8 +447,27 @@ export class InboxHub {
       }
     }
     model.snoozed = [...(model.snoozed || []).filter((thread) => !this.virtual.findThread(thread.thread_id)), ...remoteSnoozed];
-    model.pins = [...(model.pins || []).filter((thread) => !this.virtual.findThread(thread.thread_id)), ...remotePins];
+    const mergedPins = new Map((model.pins || []).map((thread) => [thread.thread_id, thread]));
+    for (const thread of remotePins) if (!mergedPins.has(thread.thread_id)) mergedPins.set(thread.thread_id, thread);
+    model.pins = [...mergedPins.values()];
     sendJson(response, 200, model);
+    return true;
+  }
+
+
+  notifyPinListeners() {
+    for (const notify of this.pinListeners) notify();
+  }
+
+  handleVirtualEventStream(request, response, url) {
+    if (url.pathname !== "/api/inbox/events" || request.method !== "GET" || !this.plannotator) return false;
+    this.plannotator.proxy(request, response, (stream) => {
+      const listener = () => {
+        if (!stream.destroyed && !stream.writableEnded) stream.write("event: pins\ndata: {}\n\n");
+      };
+      this.pinListeners.add(listener);
+      request.once("close", () => this.pinListeners.delete(listener));
+    });
     return true;
   }
 
@@ -472,6 +492,7 @@ export class InboxHub {
       if (!session) return false;
       const body = await readJson(request) || {};
       await this.virtual.setPin(session, body.pinned === true);
+      this.notifyPinListeners();
       sendJson(response, 200, { pins: await this.mergedPinEntries() });
       return true;
     }
@@ -497,6 +518,7 @@ export class InboxHub {
         }
       }
     }
+    this.notifyPinListeners();
     sendJson(response, 200, { pins: await this.mergedPinEntries() });
     return true;
   }
@@ -624,6 +646,7 @@ export class InboxHub {
       if (url.pathname === "/api/inbox/tidy" && request.method === "GET" && this.virtual.hasProject(url.searchParams.get("project"))) {
         return sendJson(response, 200, { serverSession: this.plannotator?.serverSession, count: 0, agents: [], run: null });
       }
+      if (await this.handleVirtualEventStream(request, response, url)) return;
       if (await this.handleVirtualThreadList(request, response, url)) return;
       if (await this.handleVirtualPins(request, response, url)) return;
       if (await this.handleVirtualSearch(request, response, url)) return;
