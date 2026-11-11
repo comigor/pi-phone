@@ -122,6 +122,32 @@ test("project batches replay and Undo exactly, and deletion ignores late snapsho
   assert.equal(unarchive.status, 200);
   for (const name of ["alpha", "beta", "running"]) assert.equal(hub.store.getSession(`${agentIdentity.hostId}:${name}`).resolvedAt, null);
 
+  const uploadResponse = await request("/uploads?name=reuse.txt", { method: "POST", headers: { "content-type": "text/plain" }, body: "reuse these exact bytes" });
+  const upload = (await uploadResponse.json()).upload;
+  const alphaThread = await (await request(`/threads/${alpha.thread_id}`)).json();
+  const replyRequest = nextMessage(agent, "reply");
+  const replyResponsePromise = request(`/messages/${alphaThread.thread.messages[0].id}/reply`, {
+    method: "POST", body: JSON.stringify({ idempotency_key: "reply-for-reuse", words: "Reuse this file", uploads: [upload.upload_id] })
+  });
+  const reply = await replyRequest;
+  assert.equal(reply.text, "Reuse this file");
+  agent.send(JSON.stringify({ type: "reply_result", requestId: reply.requestId, sessionId: "alpha", generation: generations.get("alpha"), ok: true }));
+  const replyBody = await (await replyResponsePromise).json();
+  const source = replyBody.reply.attachments[0];
+  assert.equal(source.name, "reuse.txt");
+  const reuseResponse = await request("/uploads/reuse", { method: "POST", body: JSON.stringify({ attachment_id: source.id, version: "sent", idempotency_key: "reuse-file" }) });
+  assert.equal(reuseResponse.status, 200);
+  const reusedUpload = (await reuseResponse.json()).upload;
+  assert.notEqual(reusedUpload.upload_id, upload.upload_id);
+  assert.equal(reusedUpload.name, source.name);
+  assert.equal(reusedUpload.sha256, source.sent_sha256);
+  assert.equal(reusedUpload.kind, source.kind);
+  assert.equal(hub.virtual.uploads.get(reusedUpload.upload_id).data.toString(), "reuse these exact bytes");
+  const reusedAgain = (await (await request("/uploads/reuse", { method: "POST", body: JSON.stringify({ attachment_id: source.id, version: "sent", idempotency_key: "reuse-file" }) })).json()).upload;
+  assert.notEqual(reusedAgain.upload_id, reusedUpload.upload_id);
+  assert.equal((await request("/uploads/reuse", { method: "POST", body: JSON.stringify({ attachment_id: source.id, version: "sent", sha256: "0".repeat(64) }) })).status, 409);
+  assert.equal((await request("/uploads/reuse", { method: "POST", body: JSON.stringify({ attachment_id: "att_00000000000000000000000000", version: "sent" }) })).status, 404);
+
   const deleted = await request(`/threads/${beta.thread_id}/delete`, { method: "POST", body: JSON.stringify({ idempotency_key: "delete-beta" }) });
   assert.equal(deleted.status, 200);
   const deletion = await deleted.json();
