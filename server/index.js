@@ -64,10 +64,12 @@ export class InboxHub {
     this.store = options.store;
     this.drafts = options.drafts;
     this.push = options.push;
+    this.autoPairLocal = options.autoPairLocal ?? process.env.PI_INBOX_AUTO_PAIR_LOCAL === "1";
     this.agentHeartbeatTimeoutMs = options.agentHeartbeatTimeoutMs ?? 60_000;
     this.agentHeartbeatCheckMs = options.agentHeartbeatCheckMs ?? 10_000;
     this.agents = new Map();
     this.sessionAgents = new Map();
+    this.socketLeases = new Map();
     this.agentClosures = new Map();
     this.viewers = new Set();
     this.pinListeners = new Set();
@@ -81,7 +83,7 @@ export class InboxHub {
     this.doorHttp = createServer((request, response) => this.virtual.route(request, response).catch((error) => sendJson(response, error.code === "session_offline" ? 503 : 400, { code: error.code || "delivery_failed", error: error.message })));
     this.agentHttp.on("upgrade", (request, socket, head) => this.handleAgentUpgrade(request, socket, head));
     this.viewerHttp.on("upgrade", (request, socket, head) => this.handleViewerUpgrade(request, socket, head));
-    this.agentWss.on("connection", (socket, _request, host) => this.handleAgentSocket(socket, host));
+    this.agentWss.on("connection", (socket, _request, host, lease) => this.handleAgentSocket(socket, host, lease));
     this.viewerWss.on("connection", (socket) => this.handleViewerSocket(socket));
   }
 
@@ -162,6 +164,10 @@ export class InboxHub {
       const publicKey = requireString(url.searchParams.get("publicKey"), "publicKey", 4096);
       const name = requireString(url.searchParams.get("name"), "name", 120);
       const host = await this.store.challengeHost({ hostId, publicKey, name });
+      const remoteAddress = request.socket?.remoteAddress;
+      if (this.autoPairLocal && !host.paired && (remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1")) {
+        await this.store.approveHost(host.id);
+      }
       const nonce = randomBytes(32).toString("base64url");
       this.challenges.set(nonce, { hostId, publicKey, expiresAt: Date.now() + 5 * 60_000 });
       return sendJson(response, 200, { nonce, paired: host.paired, pairingCode: host.pairingCode });
@@ -174,6 +180,16 @@ export class InboxHub {
     try {
       const url = new URL(request.url, "http://localhost");
       if (url.pathname !== "/ws") throw new Error("Not found");
+      const bearerMatch = String(request.headers.authorization || "").match(/^Bearer\s+(hnd_\S+)$/i);
+      const handoffToken = bearerMatch?.[1] || url.searchParams.get("handoffToken");
+      if (handoffToken) {
+        const lease = this.store.verifyHandoffToken(handoffToken);
+        if (!lease) throw new Error("Invalid handoff token");
+        const host = this.store.getHost(lease.hostId);
+        if (!host?.paired) throw new Error("Host not paired");
+        this.agentWss.handleUpgrade(request, socket, head, (websocket) => this.agentWss.emit("connection", websocket, request, host, lease));
+        return;
+      }
       const hostId = requireString(url.searchParams.get("hostId"), "hostId", 100);
       const publicKey = requireString(url.searchParams.get("publicKey"), "publicKey", 4096);
       const nonce = requireString(url.searchParams.get("nonce"), "nonce", 200);
@@ -184,14 +200,15 @@ export class InboxHub {
       const host = this.store.getHost(hostId);
       if (!host || host.publicKey !== publicKey) throw new Error("Unknown host");
       this.challenges.delete(nonce);
-      this.agentWss.handleUpgrade(request, socket, head, (websocket) => this.agentWss.emit("connection", websocket, request, host));
+      this.agentWss.handleUpgrade(request, socket, head, (websocket) => this.agentWss.emit("connection", websocket, request, host, null));
     } catch {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
     }
   }
 
-  async handleAgentSocket(socket, host) {
+  async handleAgentSocket(socket, host, lease = null) {
+    if (lease) this.socketLeases.set(socket, lease);
     const sockets = this.agents.get(host.id) ?? new Set();
     sockets.add(socket);
     this.agents.set(host.id, sockets);
@@ -222,7 +239,8 @@ export class InboxHub {
       try {
         const sockets = this.agents.get(host.id);
         if (!sockets?.delete(socket)) return;
-        await this.launch.closed(host, socket);
+        if (lease) this.socketLeases.delete(socket);
+        else await this.launch.closed(host, socket);
         for (const [sessionKey, route] of this.sessionAgents) {
           if (route.socket !== socket) continue;
           this.sessionAgents.delete(sessionKey);
@@ -241,23 +259,84 @@ export class InboxHub {
     });
     await this.store.setHostOnline(host.id, true);
     if (host.paired) await this.virtual.ensureLinked(host);
-    socketSend(socket, host.paired ? { type: "paired" } : { type: "pairing_required", pairingCode: host.pairingCode });
+    socketSend(socket, host.paired ? { type: "paired", ...(lease ? { handoff: { leaseId: lease.id, sessionId: lease.sessionId } } : {}) } : { type: "pairing_required", pairingCode: host.pairingCode });
     this.broadcastState();
   }
 
   async handleAgentMessage(host, socket, message) {
     if (message.type === "ping") return socketSend(socket, { type: "pong" });
-    if (message.type === "host_hello") return this.launch.hello(host, message, socket);
-    if (["launch_result", "folder_list_result", "clone_check_result", "clone_target_result", "skill_list_result", "skill_content_result"].includes(message.type)) return this.launch.result(message);
+    const socketLease = this.socketLeases.get(socket) || null;
+    if (socketLease) {
+      if (message.type === "host_hello") return;
+      if (!["session_upsert", "session_patch", "session_event", "agent_settled", "ui_prompt_start", "ui_prompt_end", "reply_result", "stop_result"].includes(message.type)) {
+        throw new Error("Forbidden on handoff lease");
+      }
+      const activeLease = this.store.getActiveHandoffLease(socketLease.sessionKey);
+      if (!activeLease || activeLease.id !== socketLease.id) {
+        socketSend(socket, { type: "handoff_fenced", sessionId: socketLease.sessionId });
+        socket.close();
+        return;
+      }
+    } else {
+      if (message.type === "host_hello") return this.launch.hello(host, message, socket);
+      if (["launch_result", "folder_list_result", "clone_check_result", "clone_target_result", "skill_list_result", "skill_content_result"].includes(message.type)) return this.launch.result(message);
+      if (message.type === "handoff_issue") {
+        const requestId = requireString(message.requestId, "requestId", 100);
+        const sessionId = requireString(message.sessionId, "sessionId", 300);
+        const key = `${host.id}:${sessionId}`;
+        for (const [candidate, candidateLease] of this.socketLeases) {
+          if (candidateLease.sessionKey !== key) continue;
+          socketSend(candidate, { type: "handoff_fenced", sessionId });
+          candidate.close();
+        }
+        const { lease, token } = await this.store.issueHandoffLease(host.id, {
+          sessionId,
+          cwd: typeof message.cwd === "string" ? message.cwd : "",
+          name: typeof message.name === "string" ? message.name : "",
+          model: typeof message.model === "string" ? message.model : "",
+          thinkingLevel: typeof message.thinkingLevel === "string" ? message.thinkingLevel : "",
+          target: typeof message.target === "string" ? message.target : "remote"
+        });
+        const existingRoute = this.sessionAgents.get(key);
+        if (existingRoute?.socket === socket) {
+          this.sessionAgents.delete(key);
+          await this.store.setSessionOffline(key, existingRoute.generation);
+        }
+        this.broadcastState();
+        return socketSend(socket, { type: "handoff_issue_result", requestId, sessionId, leaseId: lease.id, token, ok: true });
+      }
+      if (message.type === "handoff_fence") {
+        const requestId = requireString(message.requestId, "requestId", 100);
+        const sessionId = requireString(message.sessionId, "sessionId", 300);
+        const leaseId = typeof message.leaseId === "string" && message.leaseId ? message.leaseId : undefined;
+        const key = `${host.id}:${sessionId}`;
+        const { fenced } = await this.store.fenceHandoffLease(host.id, sessionId, leaseId);
+        for (const [candidate, candidateLease] of this.socketLeases) {
+          if (candidateLease.sessionKey !== key || (leaseId && candidateLease.id !== leaseId)) continue;
+          const route = this.sessionAgents.get(key);
+          if (route?.socket === candidate) {
+            this.sessionAgents.delete(key);
+            await this.store.setSessionOffline(key, route.generation);
+          }
+          socketSend(candidate, { type: "handoff_fenced", sessionId });
+          candidate.close();
+        }
+        this.broadcastState();
+        return socketSend(socket, { type: "handoff_fence_result", requestId, sessionId, fenced, ok: true });
+      }
+    }
     const sessionId = requireString(message.sessionId, "sessionId", 300);
+    if (socketLease && sessionId !== socketLease.sessionId) throw new Error("Session outside handoff lease");
     const generation = requireString(message.generation, "generation", 100);
     const key = `${host.id}:${sessionId}`;
     if (this.store.isSessionDeleted(key)) return;
+    if (!socketLease && this.store.getActiveHandoffLease(key)) return;
     if (message.type === "session_upsert" || message.type === "session_patch") {
       requireString(message.session?.generation, "generation", 100);
       if (message.session.generation !== generation || message.session.sessionId !== sessionId) throw new Error("Session identity mismatch");
       if (message.type === "session_upsert" && !this.store.getSession(key) && !message.session.messages?.length && !this.launch.hasPending(host.id, sessionId)) return;
-      const session = message.type === "session_patch" ? await this.store.patchSession(host.id, message.session) : await this.store.upsertSession(host.id, message.session);
+      const writeOptions = socketLease ? { preserveCwd: socketLease.originCwd } : undefined;
+      const session = message.type === "session_patch" ? await this.store.patchSession(host.id, message.session, writeOptions) : await this.store.upsertSession(host.id, message.session, writeOptions);
       if (!session) return socketSend(socket, { type: "session_snapshot_required", sessionId, generation });
       await this.virtual.ensureLinked(host);
       this.sessionAgents.set(key, { socket, generation });
