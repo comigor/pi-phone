@@ -227,9 +227,9 @@ export class HostLaunchCoordinator {
 
   async trust(session) {
     if (session.launch.deleted_at) throw Object.assign(new Error("That launch was deleted."), { code: "launch_not_found" });
-    const retry = session.launch.untrusted === true;
+    if (session.launch.untrusted !== true) return session.launch;
     await this.store.updateVirtualSession(session.key, { launch: { ...session.launch, trusted_at: new Date().toISOString(), untrusted: false, error: null } });
-    if (retry) await this.ensureOnline(session);
+    await this.ensureOnline(session);
     return session.launch;
   }
 
