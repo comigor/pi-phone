@@ -1130,6 +1130,24 @@ export class VirtualMachines {
       await this.persistUpload(upload);
       return send(response, 200, { upload: { upload_id: uploadId, name, size: bytes.length, mime_type: upload.mimeType } });
     }
+    if (route === "uploads/reuse" && request.method === "POST") {
+      const body = await bodyJson(request);
+      let source;
+      if (typeof body.attachment_id === "string") {
+        for (const session of this.sessions(machine)) {
+          source = this.persistedAttachments(session).find((attachment) => attachment.id === body.attachment_id);
+          if (source) break;
+        }
+      }
+      if (!source || source.unavailable) return send(response, 404, { code: "upload_not_found", error: "That file is no longer in the Inbox" });
+      const expectedSha = body.version === "current" ? source.current?.sha256 : source.sent_sha256;
+      if (typeof body.sha256 === "string" && body.sha256 !== expectedSha) return send(response, 409, { code: "upload_changed", error: "That file changed; open it again before reusing it" });
+      const uploadId = id("upl", randomUUID());
+      const upload = { upload_id: uploadId, name: source.name, data: source.data, mimeType: source.mimeType, sha256: expectedSha, kind: source.kind };
+      this.uploads.set(uploadId, upload);
+      await this.persistUpload(upload);
+      return send(response, 200, { upload: { upload_id: uploadId, name: upload.name, size: upload.data.length, mime_type: upload.mimeType, kind: upload.kind, sha256: upload.sha256 } });
+    }
     let match = route.match(new RegExp("^uploads/([^/]+)/text$"));
     if (match && request.method === "GET") {
       const upload = this.uploads.get(match[1]);
