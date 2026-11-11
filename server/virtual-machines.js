@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { attachmentKind, isTextAttachment, sendAttachmentBytes } from "./attachments.js";
 import { paginateSearchAnswer, searchVirtualSessions } from "./search.js";
 import { isVisibleMessage } from "./visible-messages.js";
 
@@ -38,17 +39,6 @@ function sendSerialized(response, status, body) {
   response.end(body);
 }
 
-function sendBytes(response, status, bytes, contentType) {
-  response.writeHead(status, {
-    "content-type": contentType,
-    "content-length": bytes.length,
-    "cache-control": "no-store",
-    "content-security-policy": "sandbox",
-    "cross-origin-resource-policy": "same-origin",
-    "x-content-type-options": "nosniff"
-  });
-  response.end(bytes);
-}
 
 async function bodyJson(request) {
   let body = "";
@@ -107,7 +97,7 @@ function attachmentFor(session, message, attachment, index, messageIndex = index
     path: attachment.path || name,
     named_path: attachment.named_path || null,
     name,
-    kind: mimeType.startsWith("image/") ? "image" : "file",
+    kind: attachmentKind({ mimeType, name }),
     size: data.length,
     data,
     mimeType,
@@ -155,11 +145,13 @@ export class VirtualMachines {
     this.publicAddress = options.publicAddress;
     this.file = path.join(options.dataDir, "virtual-machines.json");
     this.uploadsDir = path.join(options.dataDir, "uploads");
+    this.markupsDir = path.join(options.dataDir, "markups");
     this.drafts = options.drafts;
     this.machines = new Map();
     this.streams = new Map();
     this.linkRetries = new Map();
     this.uploads = new Map();
+    this.markups = new Map();
     this.threadCache = new Map();
     this.messageCache = new WeakMap();
     this.changeBatches = new Map();
@@ -184,6 +176,15 @@ export class VirtualMachines {
       } catch {
       }
     }
+    await mkdir(this.markupsDir, { recursive: true, mode: 0o700 });
+    for (const name of await readdir(this.markupsDir)) {
+      if (!/^[0-9a-f]{64}\.(?:png|jpg|webp)$/.test(name)) continue;
+      const data = await readFile(path.join(this.markupsDir, name));
+      let mimeType = "image/webp";
+      if (name.endsWith(".png")) mimeType = "image/png";
+      else if (name.endsWith(".jpg")) mimeType = "image/jpeg";
+      this.markups.set(name, { name, data, mimeType, sent_sha256: name.slice(0, 64), kind: "image" });
+    }
   }
 
   persist() {
@@ -193,6 +194,10 @@ export class VirtualMachines {
 
   persistUpload(upload) {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(() => writeFile(path.join(this.uploadsDir, `${upload.upload_id}.json`), JSON.stringify({ ...upload, data: upload.data.toString("base64") }), { mode: 0o600 }));
+  }
+
+  persistMarkup(markup) {
+    this.writeQueue = this.writeQueue.catch(() => undefined).then(() => writeFile(path.join(this.markupsDir, markup.name), markup.data, { mode: 0o600 }));
     return this.writeQueue;
   }
 
@@ -453,8 +458,12 @@ export class VirtualMachines {
     if (!session.launch || session.launch.deleted_at) return null;
     const stopped = Boolean(session.launchStoppedAt) || !session.online;
     const failed = Boolean(session.launch.error);
+    let state = "waiting_answer";
+    if (failed) state = "failed";
+    else if (stopped) state = "stopped";
+    else if (session.status === "running") state = "working";
     return {
-      state: failed ? "failed" : stopped ? "stopped" : session.status === "running" ? "working" : "waiting_answer",
+      state,
       launch_id: session.launch.id,
       agent: "pi",
       project: projectFor(session).name,
@@ -646,12 +655,39 @@ export class VirtualMachines {
     return messages.flatMap((message, messageIndex) => (message.attachments || message.images || []).map((item, index) => attachmentFor(session, message, item, index, messageIndex)));
   }
 
+  findAttachment(machine, attachmentId) {
+    for (const session of this.sessions(machine)) {
+      const attachment = this.persistedAttachments(session).find((item) => item.id === attachmentId);
+      if (attachment) return { session, attachment };
+    }
+    return null;
+  }
+
   attachmentsModel(session) {
     const attachments = [...new Map(this.persistedAttachments(session).map((attachment) => [attachment.id, attachment])).values()];
     return {
       attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })),
       annotations: this.pendingAnnotations(session)
     };
+  }
+
+  async saveAttachmentAnnotation(machine, body, response) {
+    const found = this.findAttachment(machine, body.attachment_id);
+    if (!found) return send(response, 404, { code: "attachment_not_found" });
+    if (!["image", "markdown", "code", "html"].includes(attachmentKind(found.attachment))) return send(response, 422, { code: "annotation_not_allowed", error: "Comments are not allowed on this attachment kind" });
+    const input = body.annotation;
+    if (!input || typeof input.id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(input.id) || typeof input.text !== "string" || !input.text.trim()) return send(response, 422, { code: "validation_error", error: "An annotation needs an id and text" });
+    const { session, attachment } = found;
+    session.messageAnnotations ??= [];
+    const previous = session.messageAnnotations.find((record) => record.id === input.id);
+    if (previous?.sent_reply_id || previous?.removed_at) return send(response, 409, { code: "annotation_closed", error: "This comment is already closed" });
+    const record = { id: input.id, message_id: attachment.message_id, thread_id: id("msg", session.key), attachment_id: attachment.id, path: attachment.path, version: body.version === "current" ? "current" : attachment.sent_sha256, message: { at: attachment.sent_at }, annotation: { ...input, text: input.text.trim() }, sent_reply_id: null, created_at: previous?.created_at || new Date().toISOString() };
+    if (previous) Object.assign(previous, record);
+    else session.messageAnnotations.push(record);
+    await this.store.persist();
+    const saved = previous || record;
+    await this.changed(session, { annotation: saved });
+    return send(response, 200, { annotation: saved });
   }
 
   async saveAnnotation(machine, messageIdValue, body, response) {
@@ -1063,10 +1099,20 @@ export class VirtualMachines {
     };
   }
 
+  async cleanupMarkups(session) {
+    const annotations = JSON.stringify(session.messageAnnotations || []);
+    for (const [name] of this.markups) {
+      if (!annotations.includes(name)) continue;
+      this.markups.delete(name);
+      await unlink(path.join(this.markupsDir, name)).catch(() => undefined);
+    }
+  }
+
   async deleteThread(machine, threadId, response) {
     const session = this.session(machine, threadId);
     if (!session) return send(response, 404, { code: "thread_not_found" });
     await this.drafts.delete(threadId);
+    await this.cleanupMarkups(session);
     await this.store.deleteVirtualSession(session.key);
     this.threadCache.delete(session.key);
     await this.changed(session, { thread_id: threadId }, "deletions");
@@ -1129,6 +1175,22 @@ export class VirtualMachines {
       if (!session) return send(response, 409, { code: "session_not_live", error: "Session is not live" });
       return this.reply(machine, session, body, request, response, true);
     }
+    if (route === "markups" && request.method === "POST") {
+      const data = await bodyBytes(request);
+      const mimeType = sniffMimeType(data);
+      const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[mimeType] || null;
+      if (!extension) return send(response, 422, { code: "validation_error", error: "A markup must be a PNG, JPEG, or WebP image" });
+      const name = `${createHash("sha256").update(data).digest("hex")}.${extension}`;
+      const markup = { name, data, mimeType, sent_sha256: name.slice(0, 64), kind: "image" };
+      this.markups.set(name, markup);
+      await this.persistMarkup(markup);
+      return send(response, 200, { path: path.join(this.markupsDir, name), name, url: `/api/inbox/markups/${name}` });
+    }
+    let match = route.match(new RegExp("^markups/([0-9a-f]{64}\\.(?:png|jpg|webp))$"));
+    if (match && ["GET", "HEAD"].includes(request.method)) {
+      const markup = this.markups.get(match[1]);
+      return markup ? sendAttachmentBytes(request, response, markup, "image") : send(response, 404, { code: "markup_not_found" });
+    }
     if (route === "uploads" && request.method === "POST") {
       const bytes = await bodyBytes(request);
       const uploadId = id("upl", randomUUID());
@@ -1156,7 +1218,7 @@ export class VirtualMachines {
       await this.persistUpload(upload);
       return send(response, 200, { upload: { upload_id: uploadId, name: upload.name, size: upload.data.length, mime_type: upload.mimeType, kind: upload.kind, sha256: upload.sha256 } });
     }
-    let match = route.match(new RegExp("^uploads/([^/]+)/text$"));
+    match = route.match(new RegExp("^uploads/([^/]+)/text$"));
     if (match && request.method === "GET") {
       const upload = this.uploads.get(match[1]);
       return upload ? send(response, 200, { text: upload.data.toString("utf8") }) : send(response, 404, { code: "upload_not_found" });
@@ -1200,6 +1262,7 @@ export class VirtualMachines {
       const session = this.session(machine, match[1]);
       return session ? send(response, 200, this.sessionList(machine, session.key)) : send(response, 404, { code: "thread_not_found" });
     }
+    if (route === "annotations" && request.method === "POST") return this.saveAttachmentAnnotation(machine, await bodyJson(request), response);
     match = route.match(new RegExp("^annotations/([^/]+)/remove$"));
     if (match && request.method === "POST") return this.removeAnnotation(machine, match[1], response);
     match = route.match(new RegExp("^messages/([^/]+)/annotations$"));
@@ -1270,7 +1333,9 @@ export class VirtualMachines {
         await this.changed(session);
         return send(response, 200, { run: this.run(session) });
       } catch (error) {
-        const status = error.code === "validation_error" ? 422 : error.code === "launch_not_found" ? 404 : 400;
+        let status = 400;
+        if (error.code === "validation_error") status = 422;
+        else if (error.code === "launch_not_found") status = 404;
         return send(response, status, { code: error.code || "launch_failed", error: error.message });
       }
     }
@@ -1307,13 +1372,43 @@ export class VirtualMachines {
       await this.changed(session);
       return send(response, 200, { row: this.row(session) });
     }
-    match = route.match(new RegExp("^attachments/([^/]+)/(image|download)$"));
-    if (match && request.method === "GET") {
-      for (const session of this.sessions(machine)) {
-        const attachment = this.persistedAttachments(session).find((item) => item.id === match[1]);
-        if (attachment) return sendBytes(response, 200, attachment.data, attachment.mimeType);
+    match = route.match(new RegExp("^messages/([^/]+)/image$"));
+    if (match && ["GET", "HEAD"].includes(request.method)) {
+      const session = this.findByMessage(machine, match[1]);
+      const images = session ? this.persistedAttachments(session).filter((item) => item.message_id === match[1] && attachmentKind(item) === "image") : [];
+      const requested = url.searchParams.get("path");
+      const image = requested ? images.find((item) => item.path === requested || item.name === requested) : images[0];
+      return image ? sendAttachmentBytes(request, response, image, "image") : send(response, 404, { code: "image_not_found" });
+    }
+    match = route.match(new RegExp("^attachments/([^/]+)/(view|page|video|audio|image|download)$"));
+    if (match) {
+      const action = match[2];
+      if (!["GET", "HEAD"].includes(request.method) || (["view", "video", "audio"].includes(action) && request.method !== "GET")) return send(response, 405, { error: "Use GET." });
+      const found = this.findAttachment(machine, match[1]);
+      if (!found) return send(response, 404, { code: "attachment_not_found" });
+      const { session, attachment } = found;
+      const kind = attachmentKind(attachment);
+      if (action === "view") {
+        if (!isTextAttachment(attachment)) return send(response, 422, { code: "validation_error", error: "This attachment is not text" });
+        const { data, mimeType, ...descriptor } = attachment;
+        return send(response, 200, { serverSession: id("srv", session.hostId), attachment: { ...descriptor, mime_type: mimeType }, version: url.searchParams.get("version") === "current" ? "current" : attachment.sent_sha256, text: data.toString("utf8"), html: kind === "html" ? data.toString("utf8") : null });
       }
-      return send(response, 404, { code: "attachment_not_found" });
+      if (action === "page") {
+        if (kind !== "html") return send(response, 422, { code: "attachment_not_html", error: `${attachment.name} is not an HTML page.` });
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": attachment.data.length, "content-security-policy": "sandbox allow-scripts allow-modals; connect-src 'none'", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+        return response.end(request.method === "HEAD" ? undefined : attachment.data);
+      }
+      if (["video", "audio"].includes(action) && kind !== action) return send(response, 422, { code: `attachment_not_${action}`, error: `${attachment.name} is not ${action === "audio" ? "a recording" : "a video"}; download it instead.` });
+      if (action === "image" && kind !== "image") return send(response, 422, { code: "attachment_not_image", error: `${attachment.name} is not an image; download it instead.` });
+      return sendAttachmentBytes(request, response, attachment, action);
+    }
+    match = route.match(new RegExp("^attachments/([^/]+)$"));
+    if (match && ["GET", "HEAD"].includes(request.method)) {
+      const found = this.findAttachment(machine, match[1]);
+      if (!found) return send(response, 404, { code: "attachment_not_found" });
+      if (!isTextAttachment(found.attachment)) return send(response, 422, { code: "validation_error", error: "This attachment is not text" });
+      response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-length": found.attachment.data.length, "content-security-policy": "sandbox", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+      return response.end(request.method === "HEAD" ? undefined : found.attachment.data);
     }
     return send(response, 404, { code: "device_route_not_found", error: "Not found" });
   }
