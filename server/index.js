@@ -250,6 +250,7 @@ export class InboxHub {
     const sessionId = requireString(message.sessionId, "sessionId", 300);
     const generation = requireString(message.generation, "generation", 100);
     const key = `${host.id}:${sessionId}`;
+    if (this.store.isSessionDeleted(key)) return;
     if (message.type === "session_upsert" || message.type === "session_patch") {
       requireString(message.session?.generation, "generation", 100);
       if (message.session.generation !== generation || message.session.sessionId !== sessionId) throw new Error("Session identity mismatch");

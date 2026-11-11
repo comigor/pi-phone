@@ -486,6 +486,22 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.deepEqual((await projectArchive(true)).batch.resolved, [listed.thread_id]);
   assert.deepEqual((await projectArchive(false)).threads.map((thread) => thread.thread_id), [listed.thread_id]);
 
+  await hub.store.updateVirtualSession(`${agentIdentity.hostId}:${sessionId}`, { status: "idle" });
+  const projectReadBody = { serverSession: centralHealth.serverSession, idempotency_key: "project-read-contract", batch_id: "project-read-contract" };
+  const projectReadResponse = await fetch(`${forwardedBase}/projects/${listed.project_id}/read`, { method: "POST", headers: { "content-type": "application/json", origin: central }, body: JSON.stringify(projectReadBody) });
+  assert.equal(projectReadResponse.status, 200);
+  const projectRead = await projectReadResponse.json();
+  assert.ok(projectRead.batch.read.includes(listed.thread_id));
+  const projectReadReplay = await fetch(`${forwardedBase}/projects/${listed.project_id}/read`, { method: "POST", headers: { "content-type": "application/json", origin: central }, body: JSON.stringify(projectReadBody) });
+  assert.equal(projectReadReplay.headers.get("idempotent-replayed"), "true");
+  assert.deepEqual((await projectReadReplay.json()).batch, projectRead.batch);
+  const projectUndo = await fetch(`${forwardedBase}/projects/${listed.project_id}/unread`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "project-unread-contract", threads: projectRead.batch.read, looked: projectRead.batch.looked })
+  });
+  assert.equal(projectUndo.status, 200);
+  assert.ok((await projectUndo.json()).threads.some((thread) => thread.thread_id === listed.thread_id));
+
   const pin = async (pinned) => {
     const response = await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/inbox/threads/${listed.thread_id}/pin`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -834,6 +850,18 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   assert.equal(deleteResponse.status, 200);
   assert.deepEqual(await deleteResponse.json(), { ok: true, scratch_removed: true });
   assert.equal((await (await fetch(`${forwardedBase}/threads/${scratchLaunched.thread_id}`)).json()).run, null);
+  const threadDelete = await fetch(`${forwardedBase}/threads/${scratchLaunched.thread_id}/delete`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "upstream-thread-delete-contract" })
+  });
+  assert.equal(threadDelete.status, 200);
+  const threadDeletion = await threadDelete.json();
+  assert.equal(threadDeletion.ok, true);
+  assert.deepEqual(Object.keys(threadDeletion.store).sort(), ["bytes", "dir", "projects"]);
+  assert.equal((await fetch(`${forwardedBase}/threads/${scratchLaunched.thread_id}`)).status, 404);
+  scratchChild.send(JSON.stringify({ type: "session_upsert", sessionId: scratchStart.sessionId, generation: scratchGeneration, session: { sessionId: scratchStart.sessionId, generation: scratchGeneration, cwd: "/workspace/scratch", name: "Scratch central", model: "test/model", status: "idle", messages: [{ id: "late-scratch", role: "assistant", text: "Do not resurrect" }] } }));
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(hub.store.getSession(`${agentIdentity.hostId}:${scratchStart.sessionId}`), undefined);
   scratchChild.close();
   child.close();
 
