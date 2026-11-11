@@ -232,13 +232,13 @@ export class InboxStore {
     return this.state.sessions.find((item) => item.key === key);
   }
 
-  async appendRemoteReply(key, { requestId, text, attachments = [] }) {
+  async appendRemoteReply(key, { requestId, text, attachments = [], ...extra }) {
     const session = this.getSession(key);
     if (!session) throw new Error("Unknown session");
     session.remoteReplies ??= [];
     const previous = session.remoteReplies.find((message) => message.requestId === requestId);
     if (previous) return { session, message: previous, replayed: true };
-    const message = { id: `relay:${requestId}`, requestId, role: "user", text, attachments, createdAt: new Date().toISOString() };
+    const message = { id: `relay:${requestId}`, requestId, role: "user", text, attachments, ...extra, createdAt: new Date().toISOString() };
     session.remoteReplies.push(message);
     session.virtualCursor = (session.virtualCursor ?? 0) + 1;
     await this.persist();
