@@ -351,6 +351,7 @@ export class VirtualMachines {
       ack: session.acks?.[mid] || null,
       to: message.to || override.to || null,
       ...(message.handoff || override.handoff ? { handoff: override.handoff || message.handoff } : {}),
+      ...(message.guide ? { guide: message.guide, guide_reviewed: session.guideReviewed?.[mid] || message.guide_reviewed || null } : {}),
       ...(questions.length ? { questions } : {}),
       ...override,
       ...(attachments.length ? { attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })) } : {})
@@ -359,7 +360,7 @@ export class VirtualMachines {
 
   cachedVirtualMessage(session, message, index) {
     const mid = messageId(session, message, index);
-    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null, session.messageOverrides?.[mid] || null, session.questionAnswers || null, session.actionStates || null, index === 0 ? session.seenThroughSeq ?? null : null]);
+    const key = JSON.stringify([mid, index, session.sessionId, session.name, session.cwd, session.resolvedAt, message.createdAt || session.updatedAt, session.acks?.[mid] || null, session.messageOverrides?.[mid] || null, session.questionAnswers || null, session.actionStates || null, session.guideReviewed?.[mid] || null, index === 0 ? session.seenThroughSeq ?? null : null]);
     const cached = this.messageCache.get(message);
     if (cached?.key === key) return cached.value;
     const value = this.virtualMessage(session, message, index);
@@ -464,7 +465,7 @@ export class VirtualMachines {
       waiting_since: waiting ? activityAt(session) : null,
       unseen,
       sent: null,
-      guide: false,
+      guide: sourceMessages.some((message) => message.guide),
       last_agent_at: activityAt(session),
       section: waiting ? "waiting" : "sent",
       unread: !session.readAt || unseen > 0
@@ -680,12 +681,80 @@ export class VirtualMachines {
     return null;
   }
 
+  renderHtml(machine, attachment, text) {
+    const base = `/api/inbox/m/${machine.inboxId}/html-assets/${encodeURIComponent(attachment.id)}/`;
+    const tag = `<base href="${base}">`;
+    return text.includes("<head>") ? text.replace("<head>", `<head>${tag}`) : `${tag}${text}`;
+  }
+
+  htmlAsset(machine, token, requested) {
+    const found = this.findAttachment(machine, token);
+    if (!found || attachmentKind(found.attachment) !== "html") return null;
+    const segments = requested.replaceAll("\\", "/").split("/");
+    if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.startsWith(".") || segment === ".env")) return null;
+    const target = path.posix.normalize(path.posix.join(path.posix.dirname(found.attachment.path), ...segments));
+    if (target.startsWith("../") || target.startsWith("/")) return null;
+    return this.persistedAttachments(found.session).find((item) => item.path === target || (segments.length === 1 && item.name === segments[0])) || null;
+  }
+
   attachmentsModel(session) {
     const attachments = [...new Map(this.persistedAttachments(session).map((attachment) => [attachment.id, attachment])).values()];
     return {
       attachments: attachments.map(({ data: _data, mimeType, ...attachment }) => ({ ...attachment, mime_type: mimeType })),
       annotations: this.pendingAnnotations(session)
     };
+  }
+
+  guideSnapshot(session, messageIdValue) {
+    for (const [index, message] of this.sourceMessagesFor(session).entries()) {
+      if (messageId(session, message, index) === messageIdValue) return message.guideSnapshot || message.snapshot || session.guideSnapshots?.[messageIdValue] || null;
+    }
+    return session.guideSnapshots?.[messageIdValue] || null;
+  }
+
+  guide(session, messageIdValue, response) {
+    const message = this.messageById(session, messageIdValue);
+    if (!message) return send(response, 404, { code: "message_not_found", error: "No such message" });
+    const snapshot = this.guideSnapshot(session, messageIdValue);
+    if (!message.guide || !snapshot) return send(response, 404, { code: "guide_not_found", error: "This message carries no guided review" });
+    return send(response, 200, { message_id: messageIdValue, guide: message.guide, snapshot });
+  }
+
+  async reviewGuide(session, messageIdValue, body, response) {
+    const message = this.messageById(session, messageIdValue);
+    if (!message) return send(response, 404, { code: "message_not_found" });
+    if (!message.guide) return send(response, 404, { code: "guide_not_found" });
+    if (!Array.isArray(body.reviewed) || body.reviewed.some((value) => typeof value !== "boolean")) return send(response, 422, { code: "validation_error", error: "reviewed: a list of booleans, one per section" });
+    const reviewed = Array.from({ length: message.guide.sections }, (_, index) => body.reviewed[index] === true);
+    session.guideReviewed ??= {};
+    session.guideReviewed[messageIdValue] = reviewed;
+    await this.store.persist();
+    await this.changed(session);
+    return send(response, 200, { message_id: messageIdValue, reviewed });
+  }
+
+  async saveGuideAnnotation(session, messageIdValue, body, response) {
+    const message = this.messageById(session, messageIdValue);
+    if (!message) return send(response, 404, { code: "message_not_found" });
+    if (!message.guide) return send(response, 404, { code: "guide_not_found" });
+    const input = body.annotation;
+    if (!input || typeof input.id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(input.id) || typeof input.text !== "string" || !input.text.trim()) return send(response, 422, { code: "validation_error", error: "A guide annotation needs an id and text" });
+    const general = input.scope === "general";
+    const filePath = general ? "" : input.filePath;
+    if ((!general && (typeof filePath !== "string" || !filePath || !["old", "new"].includes(input.side) || !Number.isInteger(input.lineStart) || !Number.isInteger(input.lineEnd) || input.lineStart < 1 || input.lineEnd < input.lineStart)) || (general && input.filePath)) {
+      return send(response, 422, { code: "validation_error", error: "A guide line comment needs a file, side, and valid line range" });
+    }
+    session.messageAnnotations ??= [];
+    const previous = session.messageAnnotations.find((record) => record.id === input.id);
+    if (previous && previous.message_id !== messageIdValue) return send(response, 422, { code: "validation_error", error: "annotation.id is already used on another message" });
+    if (previous?.sent_reply_id || previous?.removed_at) return send(response, 409, { code: "annotation_closed", error: "This comment is already closed" });
+    const record = { id: input.id, project_id: projectFor(session).id, thread_id: id("msg", session.key), message_id: messageIdValue, attachment_id: "", path: filePath, version: message.guide.sha256, guide: { title: message.guide.title, file: filePath, side: general ? "new" : input.side, line_start: general ? 0 : input.lineStart, line_end: general ? 0 : input.lineEnd, ...(input.scope ? { scope: input.scope } : {}) }, message: { at: message.created_at }, annotation: { ...input, text: input.text.trim() }, sent_reply_id: null, created_at: previous?.created_at || new Date().toISOString(), updated_at: new Date().toISOString(), removed_at: null };
+    if (previous) Object.assign(previous, record);
+    else session.messageAnnotations.push(record);
+    await this.store.persist();
+    const saved = previous || record;
+    await this.changed(session, { annotation: saved });
+    return send(response, 200, { annotation: saved });
   }
 
   async saveAttachmentAnnotation(machine, body, response) {
@@ -713,10 +782,11 @@ export class VirtualMachines {
     const target = session && this.messageById(session, messageIdValue);
     if (!session || !target) return send(response, 404, { code: "message_not_found" });
     const input = body.annotation;
+    const deletion = input?.type === "DELETION";
     if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(input.id) ||
-      typeof input.text !== "string" || !input.text.trim() || input.text.length > 10_000 || input.type === "DELETION" ||
-      (!input.diagramAnchor && (typeof input.originalText !== "string" || !input.originalText.trim() || input.originalText.length > 20_000))) {
-      return send(response, 422, { code: "validation_error", error: "A message comment needs an id, quote, and text" });
+      !["COMMENT", "DELETION"].includes(input.type) || (!deletion && (typeof input.text !== "string" || !input.text.trim() || input.text.length > 10_000)) || (deletion && typeof input.text === "string" && input.text.length > 10_000) ||
+      (typeof input.originalText !== "string" || !input.originalText.trim() || input.originalText.length > 20_000)) {
+      return send(response, 422, { code: "validation_error", error: "A message comment needs an id and quote; text is required unless this is a deletion" });
     }
     if (target.author.kind !== "agent") return send(response, 422, { code: "annotation_not_allowed", error: "Comments are allowed on agent messages" });
     session.messageAnnotations ??= [];
@@ -730,7 +800,7 @@ export class VirtualMachines {
       path: messageIdValue,
       version: "current",
       message: { at: target.created_at },
-      annotation: { ...input, text: input.text.trim() },
+      annotation: { ...input, text: typeof input.text === "string" ? input.text.trim() : "" },
       sent_reply_id: null,
       created_at: previous?.created_at || new Date().toISOString()
     };
@@ -1377,6 +1447,21 @@ export class VirtualMachines {
     if (route === "annotations" && request.method === "POST") return this.saveAttachmentAnnotation(machine, await bodyJson(request), response);
     match = route.match(new RegExp("^annotations/([^/]+)/remove$"));
     if (match && request.method === "POST") return this.removeAnnotation(machine, match[1], response);
+    match = route.match(new RegExp("^messages/([^/]+)/guide$"));
+    if (match && request.method === "GET") {
+      const session = this.findByMessage(machine, match[1]);
+      return session ? this.guide(session, match[1], response) : send(response, 404, { code: "message_not_found" });
+    }
+    match = route.match(new RegExp("^messages/([^/]+)/guide/reviewed$"));
+    if (match && request.method === "POST") {
+      const session = this.findByMessage(machine, match[1]);
+      return session ? this.reviewGuide(session, match[1], await bodyJson(request), response) : send(response, 404, { code: "message_not_found" });
+    }
+    match = route.match(new RegExp("^messages/([^/]+)/guide/annotations$"));
+    if (match && request.method === "POST") {
+      const session = this.findByMessage(machine, match[1]);
+      return session ? this.saveGuideAnnotation(session, match[1], await bodyJson(request), response) : send(response, 404, { code: "message_not_found" });
+    }
     match = route.match(new RegExp("^messages/([^/]+)/annotations$"));
     if (match && request.method === "POST") return this.saveAnnotation(machine, match[1], await bodyJson(request), response);
     match = route.match(new RegExp("^messages/([^/]+)/ack$"));
@@ -1513,6 +1598,11 @@ export class VirtualMachines {
       const image = requested ? images.find((item) => item.path === requested || item.name === requested) : images[0];
       return image ? sendAttachmentBytes(request, response, image, "image") : send(response, 404, { code: "image_not_found" });
     }
+    match = route.match(new RegExp("^html-assets/([^/]+)/(.+)$"));
+    if (match && request.method === "GET") {
+      const asset = this.htmlAsset(machine, match[1], decodeURIComponent(match[2]));
+      return asset ? sendAttachmentBytes(request, response, asset, "asset") : send(response, 404, { code: "asset_not_found" });
+    }
     match = route.match(new RegExp("^attachments/([^/]+)/(view|page|video|audio|image|download)$"));
     if (match) {
       const action = match[2];
@@ -1524,12 +1614,13 @@ export class VirtualMachines {
       if (action === "view") {
         if (!isTextAttachment(attachment)) return send(response, 422, { code: "validation_error", error: "This attachment is not text" });
         const { data, mimeType, ...descriptor } = attachment;
-        return send(response, 200, { serverSession: id("srv", session.hostId), attachment: { ...descriptor, mime_type: mimeType }, version: url.searchParams.get("version") === "current" ? "current" : attachment.sent_sha256, text: data.toString("utf8"), html: kind === "html" ? data.toString("utf8") : null });
+        return send(response, 200, { serverSession: id("srv", session.hostId), attachment: { ...descriptor, mime_type: mimeType }, version: url.searchParams.get("version") === "current" ? "current" : attachment.sent_sha256, text: data.toString("utf8"), html: kind === "html" ? this.renderHtml(machine, attachment, data.toString("utf8")) : null });
       }
       if (action === "page") {
         if (kind !== "html") return send(response, 422, { code: "attachment_not_html", error: `${attachment.name} is not an HTML page.` });
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": attachment.data.length, "content-security-policy": "sandbox allow-scripts allow-modals; connect-src 'none'", "cache-control": "no-store", "x-content-type-options": "nosniff" });
-        return response.end(request.method === "HEAD" ? undefined : attachment.data);
+        const document = Buffer.from(this.renderHtml(machine, attachment, attachment.data.toString("utf8")));
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": document.length, "content-security-policy": "sandbox allow-scripts allow-modals; connect-src 'none'", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+        return response.end(request.method === "HEAD" ? undefined : document);
       }
       if (["video", "audio"].includes(action) && kind !== action) return send(response, 422, { code: `attachment_not_${action}`, error: `${attachment.name} is not ${action === "audio" ? "a recording" : "a video"}; download it instead.` });
       if (action === "image" && kind !== "image") return send(response, 422, { code: "attachment_not_image", error: `${attachment.name} is not an image; download it instead.` });

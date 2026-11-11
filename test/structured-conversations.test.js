@@ -64,7 +64,10 @@ test("structured conversation routes preserve official response shapes", async (
   const b = randomUUID();
   const generationA = randomUUID();
   const generationB = randomUUID();
-  agent.send(JSON.stringify({ type: "session_upsert", sessionId: a, generation: generationA, session: { sessionId: a, generation: generationA, cwd: "/workspace/same", name: "Session A", status: "idle", messages: [{ id: "structured", role: "assistant", text: ":::question\nShip it?\n\n- [ ] Yes\n- [ ] No\n:::", actions: [{ key: "a-deadbeef", title: "Deploy the release", action: { where_url: "https://example.test/deploy" } }] }] } }));
+  agent.send(JSON.stringify({ type: "session_upsert", sessionId: a, generation: generationA, session: { sessionId: a, generation: generationA, cwd: "/workspace/same", name: "Session A", status: "idle", messages: [{ id: "structured", role: "assistant", text: ":::question\nShip it?\n\n- [ ] Yes\n- [ ] No\n:::", actions: [{ key: "a-deadbeef", title: "Deploy the release", action: { where_url: "https://example.test/deploy" } }], guide: { sha256: "guide-sha", input_sha256: "input-sha", bytes: 120, title: "Release review", sections: 2, files: 1, additions: 3, deletions: 1 }, guideSnapshot: { patch: { files: [{ path: "src/a.ts" }] } }, attachments: [
+    { data: Buffer.from("<html><head><link rel=\"stylesheet\" href=\"style.css\"></head><body>Guide</body></html>").toString("base64"), mimeType: "text/html", name: "page.html", path: "docs/page.html" },
+    { data: Buffer.from("body { color: green; }").toString("base64"), mimeType: "text/css", name: "style.css", path: "docs/style.css" }
+  ] }] } }));
   agent.send(JSON.stringify({ type: "session_upsert", sessionId: b, generation: generationB, session: { sessionId: b, generation: generationB, cwd: "/workspace/same", name: "Session B", status: "idle", messages: [{ id: "ready-b", role: "assistant", text: "B ready" }] } }));
   await waitFor(() => hub.sessionAgents.has(`${id.hostId}:${a}`) && hub.sessionAgents.has(`${id.hostId}:${b}`));
   const machine = hub.virtual.offer(hub.store.getHost(id.hostId)).machine;
@@ -101,6 +104,28 @@ test("structured conversation routes preserve official response shapes", async (
   assert.equal(marked.questions.find((item) => item.key === action.key).action_result.outcome, "done");
   const unmarked = await (await request(`/messages/${structured.id}/actions/${action.key}`, { idempotency_key: "action-2", outcome: null })).json();
   assert.equal(unmarked.questions.find((item) => item.key === action.key).state, "open");
+  const guideResponse = await fetch(`${door}/messages/${structured.id}/guide`, { headers: { authorization: `Bearer ${machine.token}` } });
+  assert.equal(guideResponse.status, 200);
+  const guide = await guideResponse.json();
+  assert.equal(guide.guide.title, "Release review");
+  assert.equal(guide.snapshot.patch.files[0].path, "src/a.ts");
+  const reviewed = await (await request(`/messages/${structured.id}/guide/reviewed`, { idempotency_key: "reviewed-1", reviewed: [true] })).json();
+  assert.deepEqual(reviewed.reviewed, [true, false]);
+  assert.equal((await request(`/messages/${structured.id}/guide/reviewed`, { idempotency_key: "reviewed-2", reviewed: ["yes"] })).status, 422);
+  const guideAnnotation = await (await request(`/messages/${structured.id}/guide/annotations`, { idempotency_key: "guide-ann-1", annotation: { id: "guide-line", text: "Rename this", filePath: "src/a.ts", side: "new", lineStart: 2, lineEnd: 3 } })).json();
+  assert.equal(guideAnnotation.annotation.guide.file, "src/a.ts");
+  assert.equal(guideAnnotation.annotation.guide.line_start, 2);
+  const deletion = await (await request(`/messages/${structured.id}/annotations`, { idempotency_key: "delete-ann-1", annotation: { id: "delete-words", type: "DELETION", text: "", originalText: "Ship it?" } })).json();
+  assert.equal(deletion.annotation.annotation.type, "DELETION");
+  assert.equal(deletion.annotation.annotation.text, "");
+  const htmlAttachment = structured.attachments.find((item) => item.name === "page.html");
+  const htmlView = await (await fetch(`${door}/attachments/${htmlAttachment.id}/view`, { headers: { authorization: `Bearer ${machine.token}` } })).json();
+  assert.match(htmlView.html, new RegExp(`/api/inbox/m/${machine.inboxId}/html-assets/${htmlAttachment.id}/`));
+  const css = await fetch(`${door}/html-assets/${htmlAttachment.id}/style.css`, { headers: { authorization: `Bearer ${machine.token}` } });
+  assert.equal(css.status, 200);
+  assert.equal(await css.text(), "body { color: green; }");
+  assert.equal((await fetch(`${door}/html-assets/${htmlAttachment.id}/.hidden.css`, { headers: { authorization: `Bearer ${machine.token}` } })).status, 404);
+  assert.equal((await fetch(`${door}/messages/${opened.thread.messages.find((message) => message.author.session === b)?.id || "missing"}/guide`, { headers: { authorization: `Bearer ${machine.token}` } })).status, 404);
 
   delivery = nextMessage(agent, "reply");
   const newMessageResponse = request(`/threads/${threadId}/message`, { idempotency_key: "new-message-1", session: b, body: "Take this message" });
