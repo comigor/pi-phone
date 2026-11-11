@@ -64,6 +64,9 @@ Production uses HTTPS through Tailscale Serve for the virtual door. The browser 
 | `PLANNOTATOR_DISABLED` | `0` | Set to `1` only for legacy local development |
 | `PI_INBOX_RELAY_URL` | `wss://inbox-relay.borges.dev` | Agent-side relay URL |
 | `PI_INBOX_STATE_DIR` | `~/.pi/agent/pi-inbox` | Agent identity and received non-image uploads |
+| `PI_INBOX_AUTO_PAIR_LOCAL` | `0` | Set to `1` in single-session containers to auto-approve loopback agents |
+| `PI_INBOX_HANDOFF_TOKEN` | none | Session-scoped relay lease token injected into remote handoff workers |
+| `PI_INBOX_DISABLED` | `0` | Set to `1` to disable the extension for the current process |
 
 ## Pair and use
 

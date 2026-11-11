@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { sessionKey } from "./protocol.js";
@@ -24,7 +24,7 @@ export class InboxStore {
     this.stateFile = path.join(dataDir, "state.json");
     this.writeVersion = 0;
     this.writtenVersion = 0;
-    this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [], launchIdempotency: [], deletedSessions: [] };
+    this.state = { version: 1, hosts: [], sessions: [], inbox: [], subscriptions: [], launchIdempotency: [], deletedSessions: [], handoffLeases: [] };
     this.sessionChanges = new Map();
   }
 
@@ -38,6 +38,7 @@ export class InboxStore {
     }
     this.state.launchIdempotency = Array.isArray(this.state.launchIdempotency) ? this.state.launchIdempotency : [];
     this.state.deletedSessions = Array.isArray(this.state.deletedSessions) ? this.state.deletedSessions : [];
+    this.state.handoffLeases = Array.isArray(this.state.handoffLeases) ? this.state.handoffLeases : [];
     for (const host of this.state.hosts) host.online = false;
     for (const session of this.state.sessions) {
       session.online = false;
@@ -152,7 +153,7 @@ export class InboxStore {
     return message || presentationChanged;
   }
 
-  async upsertSession(hostId, incoming) {
+  async upsertSession(hostId, incoming, options = {}) {
     const key = sessionKey(hostId, incoming.sessionId);
     let session = this.state.sessions.find((item) => item.key === key);
     if (!session) {
@@ -166,9 +167,12 @@ export class InboxStore {
     const arrivedAt = new Date().toISOString();
     const nextMessages = cleanMessages(incoming.messages).map((message) => ({ ...message, createdAt: message.createdAt || previousMessages.get(message.id)?.createdAt || arrivedAt }));
     const messagesChanged = JSON.stringify(session.messages) !== JSON.stringify(nextMessages);
+    const preservedCwd = options.preserveCwd ? excerpt(options.preserveCwd, 2048) : "";
+    const incomingCwd = excerpt(incoming.cwd, 2048);
+    if (preservedCwd && incomingCwd && incomingCwd !== preservedCwd) session.remoteCwd = incomingCwd;
     Object.assign(session, {
       generation: incoming.generation,
-      cwd: excerpt(incoming.cwd, 2048),
+      cwd: preservedCwd || incomingCwd,
       name: excerpt(incoming.name, 200),
       model: excerpt(incoming.model, 200),
       thinkingLevel: excerpt(incoming.thinkingLevel, 40),
@@ -188,7 +192,7 @@ export class InboxStore {
     return session;
   }
 
-  async patchSession(hostId, incoming) {
+  async patchSession(hostId, incoming, options = {}) {
     const key = sessionKey(hostId, incoming.sessionId);
     const session = this.getSession(key);
     if (!session) return undefined;
@@ -208,9 +212,12 @@ export class InboxStore {
       }
     }
     const changedAt = new Date().toISOString();
+    const preservedCwd = options.preserveCwd ? excerpt(options.preserveCwd, 2048) : "";
+    const incomingCwd = excerpt(incoming.cwd, 2048);
+    if (preservedCwd && incomingCwd && incomingCwd !== preservedCwd) session.remoteCwd = incomingCwd;
     Object.assign(session, {
       generation: incoming.generation,
-      cwd: excerpt(incoming.cwd, 2048),
+      cwd: preservedCwd || incomingCwd,
       name: excerpt(incoming.name, 200),
       model: excerpt(incoming.model, 200),
       thinkingLevel: excerpt(incoming.thinkingLevel, 40),
@@ -285,6 +292,82 @@ export class InboxStore {
     await this.persist();
   }
 
+  getActiveHandoffLease(key, now = Date.now()) {
+    return this.state.handoffLeases.find((item) => item.sessionKey === key && Date.parse(item.expiresAt) > now);
+  }
+
+  verifyHandoffToken(token, now = Date.now()) {
+    if (typeof token !== "string" || !token.startsWith("hnd_") || token.length > 256) return null;
+    const digest = createHash("sha256").update(token).digest();
+    for (const lease of this.state.handoffLeases) {
+      if (Date.parse(lease.expiresAt) <= now || typeof lease.tokenHash !== "string" || lease.tokenHash.length !== 64) continue;
+      if (timingSafeEqual(Buffer.from(lease.tokenHash, "hex"), digest)) return lease;
+    }
+    return null;
+  }
+
+  async issueHandoffLease(hostId, { sessionId, cwd = "", name = "", model = "", thinkingLevel = "", target = "remote", ttlMs = 7 * 24 * 60 * 60_000 }) {
+    const key = sessionKey(hostId, sessionId);
+    let session = this.getSession(key);
+    if (!session) {
+      const nowIso = new Date().toISOString();
+      session = {
+        key,
+        hostId,
+        sessionId,
+        generation: randomUUID(),
+        cwd: excerpt(cwd, 2048),
+        name: excerpt(name, 200) || path.basename(cwd || "") || sessionId,
+        model: excerpt(model, 200),
+        thinkingLevel: excerpt(thinkingLevel, 40),
+        status: "idle",
+        messages: [],
+        remoteReplies: [],
+        virtualCursor: 0,
+        online: false,
+        updatedAt: nowIso
+      };
+      this.state.sessions.push(session);
+    }
+    const originCwd = session.handoff?.originCwd || session.cwd || excerpt(cwd, 2048);
+    const token = `hnd_${randomBytes(32).toString("base64url")}`;
+    const now = Date.now();
+    const lease = {
+      id: `hl_${randomUUID()}`,
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      hostId,
+      sessionId,
+      sessionKey: key,
+      originCwd,
+      target: excerpt(target, 120) || "remote",
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + ttlMs).toISOString()
+    };
+    this.state.handoffLeases = [
+      ...this.state.handoffLeases.filter((item) => item.sessionKey !== key && Date.parse(item.expiresAt) > now),
+      lease
+    ];
+    session.cwd = originCwd;
+    session.handoff = { id: lease.id, target: lease.target, originCwd, issuedAt: lease.createdAt, expiresAt: lease.expiresAt };
+    await this.persist();
+    return { lease, token, session };
+  }
+
+  async fenceHandoffLease(hostId, sessionId, leaseId) {
+    const key = sessionKey(hostId, sessionId);
+    const matching = this.state.handoffLeases.filter((item) => item.sessionKey === key && (!leaseId || item.id === leaseId));
+    const session = this.getSession(key);
+    const clearSession = Boolean(session?.handoff && (!leaseId || session.handoff.id === leaseId));
+    if (!matching.length && !clearSession) return { fenced: false };
+    this.state.handoffLeases = this.state.handoffLeases.filter((item) => !(item.sessionKey === key && (!leaseId || item.id === leaseId)));
+    if (clearSession) {
+      delete session.handoff;
+      delete session.remoteCwd;
+    }
+    await this.persist();
+    return { fenced: matching.length > 0 || clearSession };
+  }
+
   isSessionDeleted(key) {
     return this.state.deletedSessions.includes(key);
   }
@@ -295,6 +378,7 @@ export class InboxStore {
     this.state.sessions.splice(index, 1);
     this.state.inbox = this.state.inbox.filter((item) => item.sessionKey !== key);
     this.state.launchIdempotency = this.state.launchIdempotency.filter((item) => item.sessionKey !== key);
+    this.state.handoffLeases = this.state.handoffLeases.filter((item) => item.sessionKey !== key);
     if (!this.state.deletedSessions.includes(key)) this.state.deletedSessions.push(key);
     if (this.state.deletedSessions.length > 1000) this.state.deletedSessions.splice(0, this.state.deletedSessions.length - 1000);
     this.sessionChanges.delete(key);
