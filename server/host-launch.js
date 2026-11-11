@@ -18,23 +18,27 @@ export class HostLaunchCoordinator {
     this.idempotency = new Map();
     this.waiters = new Map();
     this.capable = new WeakSet();
+    this.creationCapable = new WeakSet();
   }
 
   async hello(host, message, socket) {
     const agents = Array.isArray(message.launch?.agents) ? message.launch.agents.filter((agent) => agent === "pi") : [];
     if (agents.length) this.capable.add(socket);
     else this.capable.delete(socket);
-    host.launch = agents.length ? { agents, home: typeof message.launch.home === "string" ? message.launch.home : "/" } : null;
+    if (agents.length && message.launch.creation === 1) this.creationCapable.add(socket);
+    else this.creationCapable.delete(socket);
+    host.launch = agents.length ? { agents, home: typeof message.launch.home === "string" ? message.launch.home : "/", creation: message.launch.creation === 1 ? 1 : 0 } : null;
     await this.store.persist();
   }
 
   async closed(host, socket) {
     if (!this.capable.has(socket)) return;
-    const capable = [...(this.agents.get(host.id) || [])].some((candidate) => this.capable.has(candidate) && candidate.readyState === WebSocket.OPEN);
-    if (!capable && host.launch) {
-      host.launch = null;
-      await this.store.persist();
-    }
+    const open = [...(this.agents.get(host.id) || [])].filter((candidate) => candidate.readyState === WebSocket.OPEN);
+    const capable = open.some((candidate) => this.capable.has(candidate));
+    const creation = open.some((candidate) => this.creationCapable.has(candidate));
+    if (!capable && host.launch) host.launch = null;
+    else if (host.launch) host.launch = { ...host.launch, creation: creation ? 1 : 0 };
+    await this.store.persist();
   }
 
   result(message) {
@@ -43,7 +47,11 @@ export class HostLaunchCoordinator {
     this.requests.delete(message.requestId);
     clearTimeout(request.timeout);
     if (message.ok) request.resolve(message);
-    else request.reject(new Error(message.error || "Launch failed"));
+    else {
+      const error = new Error(message.error || "Launch failed");
+      error.code = message.code;
+      request.reject(error);
+    }
   }
 
   hasPending(hostId, sessionId) {
@@ -65,18 +73,33 @@ export class HostLaunchCoordinator {
     }
   }
 
-  requestHost(hostId, message) {
-    const socket = [...(this.agents.get(hostId) || [])].find((candidate) => this.capable.has(candidate) && candidate.readyState === WebSocket.OPEN);
-    if (!socket) return Promise.reject(new Error("Host is offline"));
+  requestHost(hostId, message, { timeoutMs = 15_000, creation = false } = {}) {
+    const socket = [...(this.agents.get(hostId) || [])].find((candidate) => this.capable.has(candidate) && (!creation || this.creationCapable.has(candidate)) && candidate.readyState === WebSocket.OPEN);
+    if (!socket) return Promise.reject(new Error(creation ? "Host launch creation is unavailable" : "Host is offline"));
     const waiter = deferred();
     const timeout = setTimeout(() => {
       this.requests.delete(message.requestId);
       waiter.reject(new Error("Launch request timed out"));
-    }, 15_000);
+    }, timeoutMs);
     timeout.unref();
     this.requests.set(message.requestId, { ...waiter, timeout });
     socket.send(JSON.stringify(message));
     return waiter.promise;
+  }
+
+  async listFolders(hostId, path) {
+    const result = await this.requestHost(hostId, { type: "folder_list", requestId: randomUUID(), path }, { creation: true });
+    return result.listing;
+  }
+
+  async cloneCheck(hostId, url) {
+    const result = await this.requestHost(hostId, { type: "clone_check", requestId: randomUUID(), url }, { creation: true, timeoutMs: 12_000 });
+    return { reach: result.reach };
+  }
+
+  async cloneTarget(hostId, url, into) {
+    const result = await this.requestHost(hostId, { type: "clone_target", requestId: randomUUID(), url, ...(into ? { into } : {}) }, { creation: true });
+    return result.target;
   }
 
   waitForSession(key) {
@@ -111,23 +134,51 @@ export class HostLaunchCoordinator {
 
   async performStart({ machine, project, body }) {
     const hostId = machine.hostId;
+    const target = body.to.launch;
     const sessionId = randomUUID();
+    let folder = project.root;
+    let scratch = target.scratch === true;
+    let arbitrary = false;
+    let clone;
+    let cloneUrl;
+    const creation = scratch || typeof target.folder === "string";
+    if (scratch) folder = "";
+    else if (typeof target.folder === "string") {
+      arbitrary = true;
+      if (target.clone && typeof target.clone === "object") {
+        const checked = await this.cloneTarget(hostId, target.clone.url, target.folder);
+        folder = checked.real;
+        cloneUrl = checked.repo.url;
+        arbitrary = checked.state === "already";
+        if (checked.state === "clone") clone = { url: checked.repo.url, ...(checked.repo.branch ? { branch: checked.repo.branch } : {}) };
+      }
+    }
     const launch = {
       id: `lch_${randomUUID()}`,
       agent: "pi",
       session_ref: sessionId,
       session: sessionId,
-      folder: project.root,
-      scratch: false,
+      folder,
+      scratch,
+      ...(target.create === true ? { made_folder: true } : {}),
+      ...(cloneUrl ? { clone: { url: cloneUrl, state: "cloned" } } : {}),
       started_at: new Date().toISOString()
     };
-    const pending = { hostId, sessionId, launch, cwd: project.root, name: body.thread_name || project.name };
+    const pending = { hostId, sessionId, launch, cwd: folder, name: body.thread_name || project.name };
     this.pending.set(launch.id, pending);
     const registered = this.waitForSession(`${hostId}:${sessionId}`);
     registered.catch(() => undefined);
     try {
-      await this.requestHost(hostId, { type: "launch_start", requestId: randomUUID(), launchId: launch.id, sessionId, cwd: pending.cwd, name: pending.name });
+      const started = await this.requestHost(hostId, {
+        type: "launch_start", requestId: randomUUID(), launchId: launch.id, sessionId,
+        cwd: pending.cwd, name: pending.name, arbitrary, create: target.create === true, scratch, ...(clone ? { clone } : {})
+      }, { creation, timeoutMs: clone ? 120_000 : 15_000 });
+      launch.folder = started.cwd || folder;
+      launch.scratch = started.scratch === true || scratch;
+      if (started.clone) launch.clone = started.clone;
+      pending.cwd = launch.folder;
       const session = await registered;
+      await this.store.updateVirtualSession(session.key, { launch, launchStoppedAt: null });
       return { session, launch, replayed: false };
     } catch (error) {
       this.pending.delete(launch.id);

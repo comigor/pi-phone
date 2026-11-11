@@ -386,7 +386,7 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   });
 
   await fetch(`http://127.0.0.1:${addresses.viewer.port}/api/hosts/${agentIdentity.hostId}/approve`, { method: "POST" });
-  agent.send(JSON.stringify({ type: "host_hello", launch: { agents: ["pi"], home: "/Users/igor" } }));
+  agent.send(JSON.stringify({ type: "host_hello", launch: { agents: ["pi"], home: "/Users/igor", creation: 1 } }));
   await waitFor(() => hub.store.getHost(agentIdentity.hostId)?.launch);
   const sessionId = randomUUID();
   const generation = randomUUID();
@@ -771,6 +771,36 @@ test("an unchanged Plannotator links to a virtual Pi host and controls its sessi
   const launchStop = stopOutcome.request;
   agent.send(JSON.stringify({ type: "launch_result", requestId: launchStop.requestId, launchId: launchStop.launchId, sessionId: launchStop.sessionId, ok: true }));
   assert.equal((await launchStopResponse).status, 200);
+
+  const folderListingRequest = nextMessage(agent, "folder_list");
+  const folderListingResponsePromise = fetch(`${forwardedBase}/launch/folders?path=~`, { headers: { origin: central, "sec-fetch-site": "same-origin", "x-plannotator-window": "1" } });
+  const folderListing = await folderListingRequest;
+  agent.send(JSON.stringify({ type: "folder_list_result", requestId: folderListing.requestId, ok: true, listing: { path: "~", exists: true, state: "folder", folders: ["Projects"], start: false, writable: true } }));
+  const folderListingResponse = await folderListingResponsePromise;
+  assert.equal(folderListingResponse.status, 200);
+  assert.deepEqual((await folderListingResponse.json()).folders, ["Projects"]);
+
+  const scratchRequest = nextMessage(agent, "launch_start");
+  const scratchResponsePromise = fetch(`${forwardedBase}/messages`, {
+    method: "POST", headers: { "content-type": "application/json", origin: central, "x-plannotator-window": "1" },
+    body: JSON.stringify({ serverSession: centralHealth.serverSession, idempotency_key: "upstream-scratch-contract", body: "Start in scratch", thread_name: "Scratch central", to: { launch: { agent: "pi", scratch: true } } })
+  });
+  const scratchStart = await scratchRequest;
+  assert.equal(scratchStart.scratch, true);
+  agent.send(JSON.stringify({ type: "launch_result", requestId: scratchStart.requestId, launchId: scratchStart.launchId, sessionId: scratchStart.sessionId, ok: true, cwd: "/workspace/scratch", scratch: true }));
+  const scratchChild = await connectAgent(addresses.agent, agentIdentity);
+  children.push(scratchChild);
+  const scratchGeneration = randomUUID();
+  const scratchDelivery = nextMessage(scratchChild, "reply");
+  scratchChild.send(JSON.stringify({ type: "session_upsert", sessionId: scratchStart.sessionId, generation: scratchGeneration, session: { sessionId: scratchStart.sessionId, generation: scratchGeneration, cwd: "/workspace/scratch", name: "Scratch central", model: "test/model", status: "idle", messages: [] } }));
+  const scratchPrompt = await scratchDelivery;
+  scratchChild.send(JSON.stringify({ type: "reply_result", requestId: scratchPrompt.requestId, sessionId: scratchStart.sessionId, generation: scratchGeneration, ok: true }));
+  const scratchResponse = await scratchResponsePromise;
+  assert.equal(scratchResponse.status, 200);
+  const scratchLaunched = await scratchResponse.json();
+  assert.equal(scratchLaunched.message.launch.scratch, true);
+  assert.equal(scratchLaunched.message.launch.folder, "/workspace/scratch");
+  scratchChild.close();
   child.close();
 
   const bystander = await connectAgent(addresses.agent, agentIdentity);
