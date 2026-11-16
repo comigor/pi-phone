@@ -440,6 +440,9 @@ class PiInboxRuntime {
     this.send({ type: "agent_settled", sessionId: this.latestSnapshot.sessionId, generation: this.generation, runId: this.currentRunId, aborted });
   }
 
+  branchChanged() {
+    this.snapshot(this.ctx.isIdle() ? "idle" : "running", true);
+  }
   promptStarted(kind: string, title?: string) {
     if (this.handedOff) return;
     this.currentPromptId = randomUUID();
@@ -500,6 +503,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_execution_end", async (event) => runtime?.event({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError }));
   pi.on("model_select", async () => runtime?.snapshot("idle"));
   pi.on("session_info_changed", async () => runtime?.snapshot("idle"));
+  pi.on("session_tree", async () => runtime?.branchChanged());
+  pi.on("session_compact", async () => runtime?.branchChanged());
   pi.on("ui_prompt_start", async (event) => runtime?.promptStarted(event.kind, event.title));
   pi.on("ui_prompt_end", async () => runtime?.promptEnded());
 }
