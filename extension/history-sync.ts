@@ -44,27 +44,36 @@ function imageContent(content: unknown) {
   }));
 }
 
+function projectMessage(entry: HistoryEntry) {
+  if (entry.type !== "message" || !entry.message) return [];
+  const message = entry.message;
+  if (message.role !== "user" && message.role !== "assistant") return [];
+  const content = message.content;
+  const toolCalls = Array.isArray(content)
+    ? content.filter((block) => block?.type === "toolCall").map((block) => ({ name: block.name, arguments: block.arguments }))
+    : [];
+  const images = imageContent(content);
+  const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : "";
+  const text = textContent(content) || errorMessage;
+  if (message.role === "assistant" && (message.stopReason === "toolUse" || toolCalls.length > 0 || (!text && images.length === 0))) return [];
+  return [{
+    id: entry.id,
+    role: message.role,
+    text,
+    images,
+    toolCalls,
+    stopReason: typeof message.stopReason === "string" ? message.stopReason : undefined,
+    errorMessage: errorMessage || undefined
+  }];
+}
+
 export function snapshotMessages(branch: readonly HistoryEntry[], latestOnly = false) {
-  return (latestOnly ? branch.slice(-1) : branch).flatMap((entry) => {
-    if (entry.type !== "message" || !entry.message) return [];
-    const message = entry.message;
-    if (message.role !== "user" && message.role !== "assistant") return [];
-    const content = message.content;
-    const toolCalls = Array.isArray(content)
-      ? content.filter((block) => block?.type === "toolCall").map((block) => ({ name: block.name, arguments: block.arguments }))
-      : [];
-    const images = imageContent(content);
-    const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : "";
-    const text = textContent(content) || errorMessage;
-    if (message.role === "assistant" && (message.stopReason === "toolUse" || toolCalls.length > 0 || (!text && images.length === 0))) return [];
-    return [{
-      id: entry.id,
-      role: message.role,
-      text,
-      images,
-      toolCalls,
-      stopReason: typeof message.stopReason === "string" ? message.stopReason : undefined,
-      errorMessage: errorMessage || undefined
-    }];
-  });
+  if (latestOnly) {
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const message = projectMessage(branch[index]);
+      if (message.length) return message;
+    }
+    return [];
+  }
+  return branch.flatMap(projectMessage);
 }

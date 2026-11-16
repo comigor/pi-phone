@@ -34,4 +34,5 @@ test("incremental snapshots skip tool entries and preserve final images", () => 
   assert.deepEqual(snapshotMessages([final], true).map((entry) => ({ id: entry.id, images: entry.images })), [
     { id: "image", images: [{ data: "aW1hZ2U=", mimeType: "image/png" }] }
   ]);
+  assert.deepEqual(snapshotMessages([final, toolResult, { type: "custom", id: "custom" }], true).map((entry) => entry.id), ["image"]);
 });
